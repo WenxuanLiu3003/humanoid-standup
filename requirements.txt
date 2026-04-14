@@ -1,0 +1,4 @@
+gymnasium[mujoco]>=1.1.0
+numpy>=1.26
+PyYAML>=6.0
+pytest>=8.0

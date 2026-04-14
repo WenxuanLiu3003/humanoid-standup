@@ -1,0 +1,23 @@
+name: ppo
+
+hyperparameters:
+  total_timesteps: 1000000
+  rollout_steps: 2048
+  minibatch_size: 64
+  update_epochs: 10
+
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  clip_ratio: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.0
+  max_grad_norm: 0.5
+
+  normalize_advantages: true
+  target_kl: null
+
+logging:
+  log_interval: 1
+  checkpoint_interval: 50
