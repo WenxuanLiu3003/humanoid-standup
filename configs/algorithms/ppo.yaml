@@ -1,22 +1,41 @@
 name: ppo
 
-hyperparameters:
-  total_timesteps: 1000000
-  rollout_steps: 2048
-  minibatch_size: 64
-  update_epochs: 10
+collection:
+  num_envs: 8
+  steps_per_env: 1024
 
-  learning_rate: 0.0003
+hyperparameters:
+  total_timesteps: 10000000
+  minibatch_size: 256
+  update_epochs: 4
+
+  learning_rate: 0.0001
   gamma: 0.99
   gae_lambda: 0.95
 
-  clip_ratio: 0.2
+  clip_ratio: 0.15
   value_coef: 0.5
-  entropy_coef: 0.0
+  entropy_coef: 0.001
   max_grad_norm: 0.5
+  clip_value_loss: true
+  value_clip_range: 0.2
 
   normalize_advantages: true
-  target_kl: null
+  target_kl: 0.02
+
+network:
+  hidden_sizes: [256, 256]
+  initial_log_std: -0.5
+
+normalization:
+  normalize_observations: true
+  observation_clip: 10.0
+  reward_scale: 0.01
+  normalize_rewards: false
+  reward_clip: 10.0
+  epsilon: 0.00000001
+
+device: auto
 
 logging:
   log_interval: 1

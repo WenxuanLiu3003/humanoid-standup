@@ -6,7 +6,7 @@ from pathlib import Path
 
 from algorithms import get_algorithm
 from config import ROOT, available_algorithms, load_algorithm_config, load_env_config
-from env import make_env
+from env import make_env, make_vector_env
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,10 +26,20 @@ def main() -> None:
     algo_config = load_algorithm_config(args.algo)
     run_dir = make_run_dir(args.algo, int(env_config.get("seed", 0)))
 
-    env = make_env(env_config)
+    num_envs = int(algo_config.get("collection", {}).get("num_envs", 1))
+    env = (
+        make_vector_env(env_config, num_envs=num_envs)
+        if num_envs > 1
+        else make_env(env_config)
+    )
     try:
         algorithm_cls = get_algorithm(args.algo)
-        algorithm = algorithm_cls(env=env, env_config=env_config, algo_config=algo_config, run_dir=run_dir)
+        algorithm = algorithm_cls(
+            env=env,
+            env_config=env_config,
+            algo_config=algo_config,
+            run_dir=run_dir,
+        )
         algorithm.train()
     finally:
         env.close()

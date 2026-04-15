@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import gymnasium as gym
+from gymnasium.vector import AutoresetMode, SyncVectorEnv
 
 
 def make_env(env_config: dict[str, Any], *, render_mode: str | None = None) -> gym.Env:
@@ -17,3 +18,26 @@ def make_env(env_config: dict[str, Any], *, render_mode: str | None = None) -> g
     env.reset(seed=seed)
     env.action_space.seed(seed)
     return env
+
+
+def make_vector_env(
+    env_config: dict[str, Any],
+    *,
+    num_envs: int,
+    render_mode: str | None = None,
+) -> SyncVectorEnv:
+    seed = int(env_config.get("seed", 0))
+
+    def make_factory(seed_offset: int):
+        def factory() -> gym.Env:
+            env = make_env(env_config, render_mode=render_mode)
+            env.reset(seed=seed + seed_offset)
+            env.action_space.seed(seed + seed_offset)
+            return env
+
+        return factory
+
+    return SyncVectorEnv(
+        [make_factory(index) for index in range(num_envs)],
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
