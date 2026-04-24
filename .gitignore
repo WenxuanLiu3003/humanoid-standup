@@ -7,6 +7,11 @@ __pycache__/
 runs/
 outputs/
 *.log
+*.sh
+
+render_checkpoint.py
+render_latest.py
+.codex
 
 .env
 .DS_Store

@@ -228,6 +228,11 @@ class PPO(Algorithm):
         self.clip_ratio = float(self.hyperparameters.get("clip_ratio", 0.2))
         self.value_coef = float(self.hyperparameters.get("value_coef", 0.5))
         self.entropy_coef = float(self.hyperparameters.get("entropy_coef", 0.0))
+        self.entropy_final_multiplier = float(
+            self.hyperparameters.get("entropy_final_multiplier", 0.1)
+        )
+        if self.entropy_final_multiplier < 0.0:
+            raise ValueError("PPO entropy_final_multiplier must be non-negative.")
         self.max_grad_norm = float(self.hyperparameters.get("max_grad_norm", 0.5))
 
         self.normalize_advantages = bool(
@@ -263,6 +268,56 @@ class PPO(Algorithm):
         )
         self.reward_clip = float(normalization_config.get("reward_clip", 10.0))
 
+        reward_shaping_config = self.algo_config.get("reward_shaping", {})
+        knee_height_config = reward_shaping_config.get("knee_height", {})
+        self.knee_height_weight = float(knee_height_config.get("weight", 0.0))
+        self.knee_height_dt = float(knee_height_config.get("dt", 0.05))
+        if self.knee_height_dt <= 0.0:
+            raise ValueError("PPO knee height reward shaping dt must be positive.")
+        knee_force_config = reward_shaping_config.get("knee_force", {})
+        self.knee_force_weight = float(knee_force_config.get("weight", 0.0))
+        knee_force_clip = knee_force_config.get("clip", 200.0)
+        self.knee_force_clip = (
+            None if knee_force_clip is None else float(knee_force_clip)
+        )
+        if self.knee_force_clip is not None and self.knee_force_clip <= 0.0:
+            raise ValueError("PPO knee force reward shaping clip must be positive.")
+        knee_symmetry_config = reward_shaping_config.get("knee_symmetry", {})
+        self.knee_symmetry_weight = float(
+            knee_symmetry_config.get("weight", 0.0)
+        )
+        hip_height_config = reward_shaping_config.get("hip_height", {})
+        self.hip_height_weight = float(hip_height_config.get("weight", 0.0))
+        self.hip_height_dt = float(hip_height_config.get("dt", 0.05))
+        if self.hip_height_dt <= 0.0:
+            raise ValueError("PPO hip height reward shaping dt must be positive.")
+        hip_velocity_config = reward_shaping_config.get("hip_velocity", {})
+        self.hip_velocity_weight = float(hip_velocity_config.get("weight", 0.0))
+        torso_upright_config = reward_shaping_config.get("torso_upright", {})
+        self.torso_upright_weight = float(
+            torso_upright_config.get("weight", 0.0)
+        )
+        abdomen_force_config = reward_shaping_config.get("abdomen_force", {})
+        self.abdomen_force_weight = float(abdomen_force_config.get("weight", 0.0))
+        abdomen_force_clip = abdomen_force_config.get("clip", 100.0)
+        self.abdomen_force_clip = (
+            None if abdomen_force_clip is None else float(abdomen_force_clip)
+        )
+        if self.abdomen_force_clip is not None and self.abdomen_force_clip <= 0.0:
+            raise ValueError("PPO abdomen force reward shaping clip must be positive.")
+        self.abdomen_force_torque_sign = float(
+            abdomen_force_config.get("torque_sign", 1.0)
+        )
+        if self.abdomen_force_torque_sign == 0.0:
+            raise ValueError("PPO abdomen force torque_sign must be non-zero.")
+        self.abdomen_force_upright_threshold = float(
+            abdomen_force_config.get("torso_upright_threshold", 0.8)
+        )
+        leg_vertical_angle_config = reward_shaping_config.get("leg_vertical_angle", {})
+        self.leg_vertical_angle_weight = float(
+            leg_vertical_angle_config.get("weight", 0.0)
+        )
+
         requested_device = str(self.algo_config.get("device", "auto"))
         if requested_device == "auto":
             requested_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -278,6 +333,7 @@ class PPO(Algorithm):
         self._current_episode_length = np.zeros(self.num_envs, dtype=np.int64)
         self._discounted_return = np.zeros(self.num_envs, dtype=np.float64)
         self.global_step = 0
+        self._resume_loaded = False
         self.checkpoint_dir = self.run_dir / "checkpoints"
         self.metrics_path = self.run_dir / "metrics.jsonl"
         self._last_approx_kl = 0.0
@@ -318,7 +374,8 @@ class PPO(Algorithm):
         self._current_episode_return = np.zeros(self.num_envs, dtype=np.float64)
         self._current_episode_length = np.zeros(self.num_envs, dtype=np.int64)
         self._discounted_return = np.zeros(self.num_envs, dtype=np.float64)
-        self.global_step = 0
+        if not self._resume_loaded:
+            self.global_step = 0
 
     def _collect_rollout(self, update_index: int) -> RolloutBatch:
         """Interact with the environment and store one PPO rollout."""
@@ -381,6 +438,27 @@ class PPO(Algorithm):
             "reward_linup": [],
             "reward_quadctrl": [],
             "reward_impact": [],
+            "knee_z": [],
+            "reward_knee": [],
+            "knee_force": [],
+            "reward_knee_force": [],
+            "right_knee_angle": [],
+            "left_knee_angle": [],
+            "knee_angle_asymmetry": [],
+            "reward_knee_symmetry": [],
+            "hip_z": [],
+            "hip_speed": [],
+            "reward_hip_height": [],
+            "reward_hip_velocity": [],
+            "torso_upright": [],
+            "reward_torso_upright": [],
+            "abdomen_force": [],
+            "abdomen_force_gate": [],
+            "reward_abdomen_force": [],
+            "right_leg_vertical_angle": [],
+            "left_leg_vertical_angle": [],
+            "leg_vertical_angle": [],
+            "reward_leg_vertical_angle": [],
             "raw_action_mean": [],
             "raw_action_std": [],
             "env_action_mean": [],
@@ -403,6 +481,100 @@ class PPO(Algorithm):
 
             next_observation_batch = self._as_observation_batch(next_observation)
             reward_array = np.asarray(reward, dtype=np.float32).reshape(self.num_envs)
+            knee_z_array, knee_reward_array = self._knee_height_reward_batch()
+            knee_force_array, knee_force_reward_array = (
+                self._knee_force_reward_batch()
+            )
+            (
+                right_knee_angle_array,
+                left_knee_angle_array,
+                knee_asymmetry_array,
+                knee_symmetry_reward_array,
+            ) = self._knee_symmetry_reward_batch()
+            (
+                hip_z_array,
+                hip_speed_array,
+                hip_height_reward_array,
+                hip_velocity_reward_array,
+            ) = self._hip_reward_batch()
+            torso_upright_array, torso_upright_reward_array = (
+                self._torso_upright_reward_batch()
+            )
+            (
+                abdomen_force_array,
+                abdomen_force_gate_array,
+                abdomen_force_reward_array,
+            ) = self._abdomen_force_reward_batch()
+            (
+                right_leg_angle_array,
+                left_leg_angle_array,
+                leg_angle_array,
+                leg_angle_reward_array,
+            ) = self._leg_vertical_angle_reward_batch()
+            reward_array = (
+                reward_array
+                + knee_reward_array
+                + knee_force_reward_array
+                + knee_symmetry_reward_array
+                + hip_height_reward_array
+                + hip_velocity_reward_array
+                + torso_upright_reward_array
+                + abdomen_force_reward_array
+                + leg_angle_reward_array
+            )
+            diagnostics["knee_z"].extend(float(value) for value in knee_z_array)
+            diagnostics["reward_knee"].extend(float(value) for value in knee_reward_array)
+            diagnostics["knee_force"].extend(float(value) for value in knee_force_array)
+            diagnostics["reward_knee_force"].extend(
+                float(value) for value in knee_force_reward_array
+            )
+            diagnostics["right_knee_angle"].extend(
+                float(value) for value in right_knee_angle_array
+            )
+            diagnostics["left_knee_angle"].extend(
+                float(value) for value in left_knee_angle_array
+            )
+            diagnostics["knee_angle_asymmetry"].extend(
+                float(value) for value in knee_asymmetry_array
+            )
+            diagnostics["reward_knee_symmetry"].extend(
+                float(value) for value in knee_symmetry_reward_array
+            )
+            diagnostics["hip_z"].extend(float(value) for value in hip_z_array)
+            diagnostics["hip_speed"].extend(float(value) for value in hip_speed_array)
+            diagnostics["reward_hip_height"].extend(
+                float(value) for value in hip_height_reward_array
+            )
+            diagnostics["reward_hip_velocity"].extend(
+                float(value) for value in hip_velocity_reward_array
+            )
+            diagnostics["torso_upright"].extend(
+                float(value) for value in torso_upright_array
+            )
+            diagnostics["reward_torso_upright"].extend(
+                float(value) for value in torso_upright_reward_array
+            )
+            diagnostics["abdomen_force"].extend(
+                float(value) for value in abdomen_force_array
+            )
+            diagnostics["abdomen_force_gate"].extend(
+                float(value) for value in abdomen_force_gate_array
+            )
+            diagnostics["reward_abdomen_force"].extend(
+                float(value) for value in abdomen_force_reward_array
+            )
+            diagnostics["right_leg_vertical_angle"].extend(
+                float(value) for value in right_leg_angle_array
+            )
+            diagnostics["left_leg_vertical_angle"].extend(
+                float(value) for value in left_leg_angle_array
+            )
+            diagnostics["leg_vertical_angle"].extend(
+                float(value) for value in leg_angle_array
+            )
+            diagnostics["reward_leg_vertical_angle"].extend(
+                float(value) for value in leg_angle_reward_array
+            )
             terminated_array = np.asarray(terminated, dtype=np.bool_).reshape(self.num_envs)
             truncated_array = np.asarray(truncated, dtype=np.bool_).reshape(self.num_envs)
             done_array = np.logical_or(terminated_array, truncated_array)
@@ -611,7 +783,6 @@ class PPO(Algorithm):
 
     def _update_policy(self, update_index: int) -> None:
         """Run PPO minibatch optimization."""
-        del update_index
         if self.rollout_buffer is None:
             raise RuntimeError("Cannot update PPO before collecting a rollout.")
         if self.rollout_buffer.advantages is None or self.rollout_buffer.returns is None:
@@ -648,6 +819,7 @@ class PPO(Algorithm):
         early_stopped = False
         early_stop_epoch: int | None = None
         minibatches_used = 0
+        entropy_coef = self._entropy_coef_for_update(update_index)
 
         for epoch_index in range(self.update_epochs):
             indices = torch.randperm(batch_size, device=self.device)
@@ -669,7 +841,7 @@ class PPO(Algorithm):
                 loss = (
                     policy_loss
                     + self.value_coef * value_loss
-                    - self.entropy_coef * entropy
+                    - entropy_coef * entropy
                 )
 
                 self.optimizer.zero_grad()
@@ -703,6 +875,7 @@ class PPO(Algorithm):
                 "policy_loss": float(np.mean(policy_losses)) if policy_losses else 0.0,
                 "value_loss": float(np.mean(value_losses)) if value_losses else 0.0,
                 "entropy": float(np.mean(entropies)) if entropies else 0.0,
+                "entropy_coef": entropy_coef,
                 "approx_kl": float(np.mean(approx_kls)) if approx_kls else 0.0,
                 "approx_kl_max": float(np.max(approx_kls)) if approx_kls else 0.0,
                 "clip_fraction": (
@@ -723,6 +896,23 @@ class PPO(Algorithm):
             }
         )
         self._update_value_metrics(buffer)
+
+    def _entropy_coef_for_update(self, update_index: int) -> float:
+        if self.num_updates <= 1:
+            return self.entropy_coef * self.entropy_final_multiplier
+
+        progress = update_index / max(self.num_updates - 1, 1)
+        final_entropy_coef = self.entropy_coef * self.entropy_final_multiplier
+        if progress <= 1.0 / 3.0:
+            return self.entropy_coef
+        if progress >= 2.0 / 3.0:
+            return final_entropy_coef
+
+        transition_progress = (progress - 1.0 / 3.0) / (1.0 / 3.0)
+        return (
+            self.entropy_coef
+            + transition_progress * (final_entropy_coef - self.entropy_coef)
+        )
 
     def _compute_policy_loss(self, batch: MiniBatch) -> torch.Tensor:
         """Compute clipped PPO policy loss."""
@@ -892,26 +1082,29 @@ class PPO(Algorithm):
 
     def load(self, path: Path) -> None:
         """Load PPO model, optimizer, and metadata."""
-        checkpoint = torch.load(path, map_location=self.device)
-        if self.policy_network is None and self.value_network is None:
-            network_config = checkpoint.get("network", {})
-            self.hidden_sizes = tuple(
-                int(hidden_size)
-                for hidden_size in network_config.get("hidden_sizes", self.hidden_sizes)
-            )
-            self.initial_log_std = float(
-                network_config.get("initial_log_std", self.initial_log_std)
-            )
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self._initialize_networks()
 
         assert self.policy_network is not None
         assert self.value_network is not None
         assert self.optimizer is not None
 
+        checkpoint_network = checkpoint.get("network", {})
+        checkpoint_hidden_sizes = tuple(
+            int(hidden_size)
+            for hidden_size in checkpoint_network.get("hidden_sizes", self.hidden_sizes)
+        )
+        if checkpoint_hidden_sizes != self.hidden_sizes:
+            raise ValueError(
+                "Checkpoint hidden_sizes do not match current config: "
+                f"{checkpoint_hidden_sizes} != {self.hidden_sizes}"
+            )
+
         self.policy_network.load_state_dict(checkpoint["policy_network"])
         self.value_network.load_state_dict(checkpoint["value_network"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.global_step = int(checkpoint.get("global_step", 0))
+        self._resume_loaded = True
         normalization_state = checkpoint.get("normalization", {})
         if "observation_rms" in normalization_state:
             self.observation_rms.load_state_dict(normalization_state["observation_rms"])
@@ -996,6 +1189,250 @@ class PPO(Algorithm):
         ).sum(dim=-1)
         return base_log_prob - tanh_log_det - self._action_log_scale_sum
 
+    def _knee_height_reward_batch(self) -> tuple[np.ndarray, np.ndarray]:
+        knee_z = np.zeros(self.num_envs, dtype=np.float32)
+        if self.knee_height_weight == 0.0:
+            return knee_z, knee_z.copy()
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                right_knee_id = env.model.joint("right_knee").id
+                left_knee_id = env.model.joint("left_knee").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO knee height reward shaping requires MuJoCo joints "
+                    "'right_knee' and 'left_knee'."
+                ) from error
+
+            right_knee_z = float(env.data.xanchor[right_knee_id, 2])
+            left_knee_z = float(env.data.xanchor[left_knee_id, 2])
+            knee_z[env_index] = 0.5 * (right_knee_z + left_knee_z)
+
+        knee_reward = self.knee_height_weight * knee_z / self.knee_height_dt
+        return knee_z, knee_reward.astype(np.float32, copy=False)
+
+    def _knee_force_reward_batch(self) -> tuple[np.ndarray, np.ndarray]:
+        knee_force = np.zeros(self.num_envs, dtype=np.float32)
+        if self.knee_force_weight == 0.0:
+            return knee_force, knee_force.copy()
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                right_knee_id = env.model.joint("right_knee").id
+                left_knee_id = env.model.joint("left_knee").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO knee force reward shaping requires MuJoCo joints "
+                    "'right_knee' and 'left_knee'."
+                ) from error
+
+            right_dof = int(env.model.jnt_dofadr[right_knee_id])
+            left_dof = int(env.model.jnt_dofadr[left_knee_id])
+            right_torque = float(env.data.qfrc_actuator[right_dof])
+            left_torque = float(env.data.qfrc_actuator[left_dof])
+            knee_force[env_index] = 0.5 * (
+                abs(right_torque) + abs(left_torque)
+            )
+
+        if self.knee_force_clip is not None:
+            knee_force = np.clip(knee_force, 0.0, self.knee_force_clip)
+
+        knee_force_reward = self.knee_force_weight * knee_force
+        return knee_force, knee_force_reward.astype(np.float32, copy=False)
+
+    def _knee_symmetry_reward_batch(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        right_knee_angle = np.zeros(self.num_envs, dtype=np.float32)
+        left_knee_angle = np.zeros(self.num_envs, dtype=np.float32)
+        knee_asymmetry = np.zeros(self.num_envs, dtype=np.float32)
+        if self.knee_symmetry_weight == 0.0:
+            return (
+                right_knee_angle,
+                left_knee_angle,
+                knee_asymmetry,
+                knee_asymmetry.copy(),
+            )
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                right_knee_id = env.model.joint("right_knee").id
+                left_knee_id = env.model.joint("left_knee").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO knee symmetry reward shaping requires MuJoCo joints "
+                    "'right_knee' and 'left_knee'."
+                ) from error
+
+            right_qpos = int(env.model.jnt_qposadr[right_knee_id])
+            left_qpos = int(env.model.jnt_qposadr[left_knee_id])
+            right_knee_angle[env_index] = float(env.data.qpos[right_qpos])
+            left_knee_angle[env_index] = float(env.data.qpos[left_qpos])
+            angle_diff = right_knee_angle[env_index] - left_knee_angle[env_index]
+            knee_asymmetry[env_index] = angle_diff * angle_diff
+
+        knee_symmetry_reward = -self.knee_symmetry_weight * knee_asymmetry
+        return (
+            right_knee_angle,
+            left_knee_angle,
+            knee_asymmetry,
+            knee_symmetry_reward.astype(np.float32, copy=False),
+        )
+
+    def _hip_reward_batch(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        hip_z = np.zeros(self.num_envs, dtype=np.float32)
+        hip_speed = np.zeros(self.num_envs, dtype=np.float32)
+        if self.hip_height_weight == 0.0 and self.hip_velocity_weight == 0.0:
+            return hip_z, hip_speed, hip_z.copy(), hip_speed.copy()
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                pelvis_id = env.model.body("pelvis").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO hip reward shaping requires a MuJoCo body named 'pelvis'."
+                ) from error
+
+            linear_velocity = np.asarray(env.data.cvel[pelvis_id, 3:6], dtype=np.float64)
+            hip_z[env_index] = float(env.data.xipos[pelvis_id, 2])
+            hip_speed[env_index] = float(np.linalg.norm(linear_velocity))
+
+        hip_height_reward = self.hip_height_weight * hip_z / self.hip_height_dt
+        hip_velocity_reward = -self.hip_velocity_weight * np.square(hip_speed)
+        return (
+            hip_z,
+            hip_speed,
+            hip_height_reward.astype(np.float32, copy=False),
+            hip_velocity_reward.astype(np.float32, copy=False),
+        )
+
+    def _torso_upright_reward_batch(self) -> tuple[np.ndarray, np.ndarray]:
+        torso_upright = np.zeros(self.num_envs, dtype=np.float32)
+        if self.torso_upright_weight == 0.0:
+            return torso_upright, torso_upright.copy()
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                torso_id = env.model.body("torso").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO torso upright reward shaping requires a MuJoCo body "
+                    "named 'torso'."
+                ) from error
+
+            torso_upright[env_index] = float(env.data.xmat[torso_id, 8])
+
+        torso_upright_reward = self.torso_upright_weight * torso_upright
+        return (
+            torso_upright,
+            torso_upright_reward.astype(np.float32, copy=False),
+        )
+
+    def _abdomen_force_reward_batch(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        abdomen_force = np.zeros(self.num_envs, dtype=np.float32)
+        abdomen_gate = np.zeros(self.num_envs, dtype=np.float32)
+        if self.abdomen_force_weight == 0.0:
+            return abdomen_force, abdomen_gate, abdomen_force.copy()
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                abdomen_y_id = env.model.joint("abdomen_y").id
+                torso_id = env.model.body("torso").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO abdomen force reward shaping requires a MuJoCo joint "
+                    "named 'abdomen_y' and a body named 'torso'."
+                ) from error
+
+            dof = int(env.model.jnt_dofadr[abdomen_y_id])
+            torque = float(env.data.qfrc_actuator[dof])
+            directed_torque = self.abdomen_force_torque_sign * torque
+            torso_upright = float(env.data.xmat[torso_id, 8])
+            abdomen_gate[env_index] = float(
+                torso_upright < self.abdomen_force_upright_threshold
+            )
+            abdomen_force[env_index] = max(directed_torque, 0.0) * abdomen_gate[env_index]
+
+        if self.abdomen_force_clip is not None:
+            abdomen_force = np.clip(abdomen_force, 0.0, self.abdomen_force_clip)
+
+        abdomen_force_reward = self.abdomen_force_weight * abdomen_force
+        return (
+            abdomen_force,
+            abdomen_gate,
+            abdomen_force_reward.astype(np.float32, copy=False),
+        )
+
+    def _leg_vertical_angle_reward_batch(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        right_angle = np.zeros(self.num_envs, dtype=np.float32)
+        left_angle = np.zeros(self.num_envs, dtype=np.float32)
+        mean_angle = np.zeros(self.num_envs, dtype=np.float32)
+        if self.leg_vertical_angle_weight == 0.0:
+            return right_angle, left_angle, mean_angle, mean_angle.copy()
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            right_angle[env_index] = self._leg_vertical_angle(
+                env,
+                hip_joint_name="right_hip_x",
+                foot_body_name="right_foot",
+            )
+            left_angle[env_index] = self._leg_vertical_angle(
+                env,
+                hip_joint_name="left_hip_x",
+                foot_body_name="left_foot",
+            )
+            mean_angle[env_index] = 0.5 * (
+                right_angle[env_index] + left_angle[env_index]
+            )
+
+        angle_reward = -self.leg_vertical_angle_weight * mean_angle
+        return (
+            right_angle,
+            left_angle,
+            mean_angle,
+            angle_reward.astype(np.float32, copy=False),
+        )
+
+    def _leg_vertical_angle(
+        self,
+        env: gym.Env,
+        *,
+        hip_joint_name: str,
+        foot_body_name: str,
+    ) -> float:
+        try:
+            hip_joint_id = env.model.joint(hip_joint_name).id
+            foot_body_id = env.model.body(foot_body_name).id
+        except KeyError as error:
+            raise ValueError(
+                "PPO leg vertical angle reward shaping requires MuJoCo joints "
+                "'right_hip_x' and 'left_hip_x', and bodies 'right_foot' "
+                "and 'left_foot'."
+            ) from error
+
+        hip_position = np.asarray(env.data.xanchor[hip_joint_id], dtype=np.float64)
+        foot_position = np.asarray(env.data.xipos[foot_body_id], dtype=np.float64)
+        leg_vector = foot_position - hip_position
+        leg_length = float(np.linalg.norm(leg_vector))
+        if leg_length <= 1e-8:
+            return float(np.pi / 2.0)
+
+        vertical_alignment = abs(float(leg_vector[2])) / leg_length
+        vertical_alignment = float(np.clip(vertical_alignment, 0.0, 1.0))
+        return float(np.arccos(vertical_alignment))
+
+    def _unwrapped_envs(self) -> list[gym.Env]:
+        envs = getattr(self.env, "envs", None)
+        if envs is None:
+            return [self.env.unwrapped]
+        return [env.unwrapped for env in envs]
+
     def _record_rollout_diagnostics(
         self,
         diagnostics: dict[str, list[float]],
@@ -1041,6 +1478,27 @@ class PPO(Algorithm):
             if key in {
                 "z_distance_from_origin",
                 "reward_linup",
+                "knee_z",
+                "reward_knee",
+                "knee_force",
+                "reward_knee_force",
+                "right_knee_angle",
+                "left_knee_angle",
+                "knee_angle_asymmetry",
+                "reward_knee_symmetry",
+                "hip_z",
+                "hip_speed",
+                "reward_hip_height",
+                "reward_hip_velocity",
+                "torso_upright",
+                "reward_torso_upright",
+                "abdomen_force",
+                "abdomen_force_gate",
+                "reward_abdomen_force",
+                "right_leg_vertical_angle",
+                "left_leg_vertical_angle",
+                "leg_vertical_angle",
+                "reward_leg_vertical_angle",
                 "raw_action_std",
                 "env_action_std",
                 "action_abs_mean",
@@ -1052,6 +1510,25 @@ class PPO(Algorithm):
                 "reward_linup",
                 "reward_quadctrl",
                 "reward_impact",
+                "knee_z",
+                "reward_knee",
+                "knee_force",
+                "reward_knee_force",
+                "right_knee_angle",
+                "left_knee_angle",
+                "knee_angle_asymmetry",
+                "reward_knee_symmetry",
+                "hip_z",
+                "reward_hip_height",
+                "reward_hip_velocity",
+                "torso_upright",
+                "reward_torso_upright",
+                "abdomen_force",
+                "reward_abdomen_force",
+                "right_leg_vertical_angle",
+                "left_leg_vertical_angle",
+                "leg_vertical_angle",
+                "reward_leg_vertical_angle",
             }:
                 summary[f"{key}_min"] = float(array.min())
         return summary

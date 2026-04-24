@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+"""Training entry point.
+
+Fresh PPO training:
+    .venv/bin/python src/train.py --algo ppo
+
+Resume PPO training from a checkpoint:
+    .venv/bin/python src/train.py --algo ppo \
+        --checkpoint runs/ppo/seed_0/<run_id>/checkpoints/final.pt
+
+Resume writes to a new run directory; it does not overwrite the old run.
+The checkpoint network architecture must match the current algorithm config.
+"""
+
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +29,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         choices=available_algorithms(),
         help="Algorithm config name under configs/algorithms/.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Optional .pt checkpoint to resume training from.",
     )
     return parser.parse_args()
 
@@ -40,6 +59,8 @@ def main() -> None:
             algo_config=algo_config,
             run_dir=run_dir,
         )
+        if args.checkpoint is not None:
+            algorithm.load(args.checkpoint.expanduser().resolve())
         algorithm.train()
     finally:
         env.close()

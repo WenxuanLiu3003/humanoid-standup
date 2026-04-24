@@ -5,27 +5,28 @@ collection:
   steps_per_env: 1024
 
 hyperparameters:
-  total_timesteps: 10000000
+  total_timesteps: 5000000
   minibatch_size: 256
   update_epochs: 4
 
-  learning_rate: 0.0001
+  learning_rate: 0.0002
   gamma: 0.99
   gae_lambda: 0.95
 
-  clip_ratio: 0.15
+  clip_ratio: 0.25
   value_coef: 0.5
-  entropy_coef: 0.001
+  entropy_coef: 0.003
+  entropy_final_multiplier: 0.1
   max_grad_norm: 0.5
   clip_value_loss: true
   value_clip_range: 0.2
 
   normalize_advantages: true
-  target_kl: 0.02
+  target_kl: null
 
 network:
   hidden_sizes: [256, 256]
-  initial_log_std: -0.5
+  initial_log_std: 0.0
 
 normalization:
   normalize_observations: true
@@ -34,6 +35,28 @@ normalization:
   normalize_rewards: false
   reward_clip: 10.0
   epsilon: 0.00000001
+
+reward_shaping:
+  knee_height:
+    weight: 2.0
+    dt: 0.05
+  knee_force:
+    weight: 0.01
+    clip: 200.0
+  knee_symmetry:
+    weight: 1.0
+  hip_height:
+    weight: 0.5
+    dt: 0.05
+  torso_upright:
+    weight: 2.0
+  abdomen_force:
+    weight: 0.01
+    clip: 100.0
+    torque_sign: 1.0
+    torso_upright_threshold: 0.8
+  leg_vertical_angle:
+    weight: 0.5
 
 device: auto
 
