@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
 from typing import Any
+
+if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
+    os.environ["MUJOCO_GL"] = "egl"
 
 import gymnasium as gym
 from gymnasium.vector import AutoresetMode, SyncVectorEnv

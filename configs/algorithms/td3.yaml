@@ -1,2 +1,93 @@
 name: td3
-hyperparameters: {}
+
+collection:
+  num_envs: 16
+
+hyperparameters:
+  total_timesteps: 8000000
+  buffer_size: 250000
+  learning_starts: 1024
+  random_steps: 2048
+  batch_size: 8192
+  gradient_steps: 2
+
+  actor_learning_rate: 0.0003
+  critic_learning_rate: 0.0003
+  gamma: 0.99
+  tau: 0.005
+  policy_delay: 2
+
+  target_policy_noise: 0.1
+  target_noise_clip: 0.25
+  exploration_noise_initial: 0.25
+  exploration_noise_final: 0.02
+  exploration_fraction: 0.5
+
+network:
+  actor_hidden_sizes: [512, 256, 128]
+  critic_hidden_sizes: [1024, 512, 256]
+
+normalization:
+  normalize_observations: true
+  observation_clip: 10.0
+  reward_scale: 0.01
+  epsilon: 0.00000001
+
+reward_shaping:
+  environment_reward:
+    initial_scale: 1.0
+    final_scale: 0.25
+    decay_steps: 2000000
+  knee_height:
+    weight: 0.5
+    dt: 0.05
+  knee_force:
+    weight: 0.0
+    clip: 200.0
+  knee_symmetry:
+    weight: 0.5
+  hip_height:
+    weight: 0.5
+    dt: 0.05
+  hip_velocity:
+    weight: 0.2
+  torso_upright:
+    weight: 60.0
+  abdomen_force:
+    weight: 0.0
+    clip: 100.0
+    torque_sign: 1.0
+    torso_upright_threshold: 0.8
+  leg_vertical_angle:
+    weight: 4.0
+  stand_hold:
+    scale: 1.0
+    base_reward: 300.0
+    success_bonus: 100.0
+    height_min: 0.55
+    height_target: 1.05
+    upright_min: 0.0
+    upright_target: 0.65
+  action_penalty:
+    weight: 2.0
+
+evaluation:
+  eval_interval: 100000
+  episodes: 1
+  max_steps: 1000
+  final_window: 200
+  height_threshold: 1.0
+  upright_threshold: 0.65
+  max_height_threshold: 1.2
+  return_threshold: 180000.0
+  consecutive_successes: 2
+  early_stop_on_success: true
+  render_final_video: true
+  video_fps: 30
+
+device: auto
+
+logging:
+  log_interval: 10000
+  checkpoint_interval: 100000
+  save_replay_buffer: false

@@ -7,7 +7,7 @@ The project is intentionally simple:
 
 - environment settings live in `configs/env.yaml`
 - each algorithm has one small config file in `configs/algorithms/`
-- algorithm implementations are placeholders for now
+- PPO and TD3 have native PyTorch implementations
 - run commands use plain Python files, not package entry points
 
 ## Setup
@@ -25,15 +25,21 @@ python -m pip install -r requirements.txt
 python src/check_env.py
 ```
 
-## Start A Future Training Run
+## Start A Training Run
 
-The command shape is already fixed, but algorithm details are not implemented yet:
+TD3 is a FastTD3-inspired off-policy baseline tuned for local GPU experiments:
 
 ```bash
 python src/train.py --algo ppo
-python src/train.py --algo sac
 python src/train.py --algo td3
 ```
 
-At this stage these commands load the environment config and algorithm config, then
-raise a clear `NotImplementedError`.
+Training writes JSONL metrics and checkpoints under `runs/<algo>/seed_<seed>/...`.
+TD3 also runs deterministic evaluation and writes a final rollout video to
+`runs/td3/.../videos/final.mp4`.
+
+Resume from a checkpoint:
+
+```bash
+python src/train.py --algo td3 --checkpoint runs/td3/seed_0/<run_id>/checkpoints/final.pt
+```

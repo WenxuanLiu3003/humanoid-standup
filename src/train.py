@@ -2,12 +2,13 @@ from __future__ import annotations
 
 """Training entry point.
 
-Fresh PPO training:
+Fresh training:
     .venv/bin/python src/train.py --algo ppo
+    .venv/bin/python src/train.py --algo td3
 
-Resume PPO training from a checkpoint:
-    .venv/bin/python src/train.py --algo ppo \
-        --checkpoint runs/ppo/seed_0/<run_id>/checkpoints/final.pt
+Resume training from a checkpoint:
+    .venv/bin/python src/train.py --algo td3 \
+        --checkpoint runs/td3/seed_0/<run_id>/checkpoints/final.pt
 
 Resume writes to a new run directory; it does not overwrite the old run.
 The checkpoint network architecture must match the current algorithm config.
@@ -44,6 +45,7 @@ def main() -> None:
     env_config = load_env_config()
     algo_config = load_algorithm_config(args.algo)
     run_dir = make_run_dir(args.algo, int(env_config.get("seed", 0)))
+    print(f"run_dir: {run_dir}", flush=True)
 
     num_envs = int(algo_config.get("collection", {}).get("num_envs", 1))
     env = (
