@@ -1,0 +1,14 @@
+name: sac0
+hyperparameters:
+  total_timesteps: 2_500_000
+  save_interval: 100_000
+  buffer_maxlength: 1_000_000
+  buffer_batch_size: 256
+  learning_rate: 0.0003
+  gradient_steps: 1
+  gamma: 0.99
+  tau: 0.005           # soft update coefficient for V target
+  alpha: 0.2           # fixed entropy temperature (no auto-tuning)
+  learning_starts: 10_000
+  reward_scale: 20.0
+  log_interval: 5000

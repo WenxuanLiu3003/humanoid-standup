@@ -1,0 +1,18 @@
+name: sac
+hyperparameters:
+  total_timesteps: 10_000_000
+  buffer_maxlength: 1_000_000
+  buffer_batch_size: 256
+  batch_size: 256
+  learning_rate: 0.0003
+  gamma: 0.99
+  tau: 0.005           # soft update coefficient
+  alpha: 0.2           # entropy temperature (or use auto-tuning)
+  learning_starts: 10_000
+  train_freq: 1
+  gradient_steps: 4
+  n_steps: 3
+  target_entropy: auto  # -dim(action_space)
+  reward_scale: 20.0
+  log_interval: 5000
+
