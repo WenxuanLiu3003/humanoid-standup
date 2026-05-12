@@ -5,15 +5,15 @@ collection:
   steps_per_env: 1024
 
 hyperparameters:
-  total_timesteps: 5000000
+  total_timesteps: 2000000
   minibatch_size: 256
   update_epochs: 4
 
-  learning_rate: 0.0002
+  learning_rate: 0.0001
   gamma: 0.99
   gae_lambda: 0.95
 
-  clip_ratio: 0.25
+  clip_ratio: 0.2
   value_coef: 0.5
   entropy_coef: 0.003
   entropy_final_multiplier: 0.1
@@ -22,7 +22,7 @@ hyperparameters:
   value_clip_range: 0.2
 
   normalize_advantages: true
-  target_kl: null
+  target_kl: 0.05
 
 network:
   hidden_sizes: [256, 256]
@@ -38,25 +38,68 @@ normalization:
 
 reward_shaping:
   knee_height:
-    weight: 2.0
+    weight: 0.75
     dt: 0.05
   knee_force:
-    weight: 0.01
+    weight: 0.0
     clip: 200.0
   knee_symmetry:
-    weight: 1.0
+    weight: 0.15
   hip_height:
-    weight: 0.5
+    weight: 0.25
     dt: 0.05
+  hip_velocity:
+    weight: 0.02
   torso_upright:
-    weight: 2.0
+    weight: 1.8
+    active_pelvis_height_threshold: 0.5
+    upright_threshold: 0.25
+    positive_only: false
+  standup_hold:
+    weight: 1.0
   abdomen_force:
-    weight: 0.01
+    weight: 0.0
     clip: 100.0
     torque_sign: 1.0
     torso_upright_threshold: 0.8
+  sway_penalty:
+    weight: 0.15
+    active_pelvis_height_threshold: 0.55
+    torso_angular_speed_tolerance: 1.0
+    pelvis_horizontal_speed_tolerance: 0.5
+    pelvis_vertical_speed_tolerance: 0.4
+    torso_angular_speed_coef: 1.0
+    pelvis_horizontal_speed_coef: 0.5
+    pelvis_vertical_speed_coef: 0.25
+  support_balance:
+    weight: 1.5
+    active_pelvis_height_threshold: 0.55
+    torso_horizontal_tolerance: 0.08
+  dual_support_symmetry:
+    weight: 0.75
+    active_pelvis_height_threshold: 0.55
+    foot_height_tolerance: 0.04
+    torso_lateral_tolerance: 0.06
+    foot_height_coef: 1.0
+    torso_lateral_coef: 0.5
   leg_vertical_angle:
-    weight: 0.5
+    weight: 0.0
+  delayed_rewards:
+    knee_height:
+      weight: 0.0
+      delay_seconds: 2.0
+      clip: 0.45
+    hip_height:
+      weight: 0.05
+      delay_seconds: 2.0
+      clip: 0.35
+    leg_vertical_angle:
+      weight: 0.0
+      delay_seconds: 2.0
+  standup_success:
+    pelvis_height_threshold: 0.72
+    torso_upright_threshold: 0.65
+    sustain_seconds: 0.4
 
 device: auto
 

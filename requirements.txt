@@ -1,5 +1,6 @@
 gymnasium[mujoco]>=1.1.0
 imageio[ffmpeg]>=2.14.1
+matplotlib>=3.8
 numpy>=1.26
 PyYAML>=6.0
 pytest>=8.0

@@ -15,3 +15,5 @@ render_latest.py
 
 .env
 .DS_Store
+*.png
+
