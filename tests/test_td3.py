@@ -120,11 +120,12 @@ def test_td3_config_has_required_sections() -> None:
 
     assert config["name"] == "td3"
     assert config["collection"]["num_envs"] == 16
+    assert config["hyperparameters"]["total_timesteps"] == 18000000
     assert config["hyperparameters"]["batch_size"] == 8192
     assert config["hyperparameters"]["target_policy_noise"] == 0.1
     assert config["hyperparameters"]["target_noise_clip"] == 0.25
     assert config["hyperparameters"]["exploration_noise_initial"] == 0.25
-    assert config["hyperparameters"]["exploration_noise_final"] == 0.02
+    assert config["hyperparameters"]["exploration_noise_final"] == 0.05
     assert config["hyperparameters"]["exploration_fraction"] == 0.5
     assert config["network"]["actor_hidden_sizes"] == [512, 256, 128]
     assert config["network"]["critic_hidden_sizes"] == [1024, 512, 256]
@@ -148,11 +149,27 @@ def test_td3_config_has_required_sections() -> None:
         "base_reward": 300.0,
         "success_bonus": 100.0,
         "height_min": 0.55,
-        "height_target": 1.05,
+        "height_target": 1.15,
         "upright_min": 0.0,
         "upright_target": 0.65,
     }
-    assert reward_shaping["action_penalty"]["weight"] == 2.0
+    assert reward_shaping["full_extension"] == {
+        "weight": 230.0,
+        "height_min": 1.05,
+        "height_target": 1.22,
+        "upright_min": 0.45,
+        "upright_target": 0.65,
+    }
+    assert reward_shaping["sustained_height"] == {
+        "weight": 180.0,
+        "height_min": 1.12,
+        "height_target": 1.20,
+        "upright_threshold": 0.65,
+        "reach_height": 1.20,
+        "fall_height": 1.00,
+        "fall_penalty": 160.0,
+    }
+    assert reward_shaping["action_penalty"]["weight"] == 3.0
 
 
 def test_actor_outputs_bounded_actions() -> None:
@@ -266,6 +283,173 @@ def test_td3_stand_hold_reward_curriculum_and_action_penalty(
         algorithm._diagnostics["reward_action_penalty"],
         [-0.0, -4.0],
     )
+
+
+def test_td3_full_extension_reward_and_diagnostics(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = tiny_algo_config()
+    config["reward_shaping"] = {
+        "full_extension": {
+            "weight": 180.0,
+            "height_min": 1.05,
+            "height_target": 1.20,
+            "upright_min": 0.45,
+            "upright_target": 0.65,
+        },
+    }
+    env = make_tiny_vector_env()
+    algorithm = TD3(
+        env=env,
+        env_config={"env_id": "TinyContinuousEnv-v0", "seed": 0},
+        algo_config=config,
+        run_dir=tmp_path,
+    )
+    envs = algorithm._unwrapped_envs()
+    metrics_by_env = {
+        id(envs[0]): (1.05, 0.45),
+        id(envs[1]): (1.20, 0.65),
+    }
+
+    def fake_torso_metrics(env) -> tuple[float, float]:
+        return metrics_by_env[id(env)]
+
+    monkeypatch.setattr(algorithm, "_torso_metrics", fake_torso_metrics)
+
+    try:
+        reward = algorithm._shape_reward(
+            np.asarray([0.0, 0.0], dtype=np.float32),
+            env_action=np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+        )
+    finally:
+        env.close()
+
+    np.testing.assert_allclose(reward, np.asarray([0.0, 180.0], dtype=np.float32))
+    np.testing.assert_allclose(
+        algorithm._diagnostics["full_extension_height_score"],
+        [0.0, 1.0],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        algorithm._diagnostics["full_extension_upright_score"],
+        [0.0, 1.0],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        algorithm._diagnostics["reward_full_extension"],
+        [0.0, 180.0],
+    )
+
+
+def test_td3_sustained_height_reward_and_fall_penalty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = tiny_algo_config()
+    config["reward_shaping"] = {
+        "sustained_height": {
+            "weight": 180.0,
+            "height_min": 1.12,
+            "height_target": 1.20,
+            "upright_threshold": 0.65,
+            "reach_height": 1.20,
+            "fall_height": 1.00,
+            "fall_penalty": 160.0,
+        },
+    }
+    env = make_tiny_vector_env()
+    algorithm = TD3(
+        env=env,
+        env_config={"env_id": "TinyContinuousEnv-v0", "seed": 0},
+        algo_config=config,
+        run_dir=tmp_path,
+    )
+    envs = algorithm._unwrapped_envs()
+    metrics_by_env = {
+        id(envs[0]): (1.12, 0.65),
+        id(envs[1]): (1.20, 0.65),
+    }
+
+    def fake_torso_metrics(env) -> tuple[float, float]:
+        return metrics_by_env[id(env)]
+
+    monkeypatch.setattr(algorithm, "_torso_metrics", fake_torso_metrics)
+
+    try:
+        reward = algorithm._shape_reward(
+            np.asarray([0.0, 0.0], dtype=np.float32),
+            env_action=np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+        )
+        metrics_by_env[id(envs[0])] = (0.95, 0.70)
+        metrics_by_env[id(envs[1])] = (0.95, 0.70)
+        fall_reward = algorithm._shape_reward(
+            np.asarray([0.0, 0.0], dtype=np.float32),
+            env_action=np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+        )
+    finally:
+        env.close()
+
+    np.testing.assert_allclose(reward, np.asarray([0.0, 180.0], dtype=np.float32))
+    np.testing.assert_allclose(
+        fall_reward,
+        np.asarray([0.0, -160.0], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        algorithm._diagnostics["sustained_height_reached"],
+        [0.0, 1.0, 0.0, 1.0],
+    )
+    np.testing.assert_allclose(
+        algorithm._diagnostics["sustained_height_fall_penalty"],
+        [-0.0, -0.0, -0.0, -160.0],
+    )
+    np.testing.assert_allclose(
+        algorithm._diagnostics["reward_sustained_height"],
+        [0.0, 180.0, 0.0, -160.0],
+    )
+
+
+def test_td3_evaluation_success_flags(tmp_path: Path) -> None:
+    config = tiny_algo_config()
+    config["evaluation"]["return_threshold"] = 100.0
+    env = make_tiny_vector_env()
+    algorithm = TD3(
+        env=env,
+        env_config={"env_id": "TinyContinuousEnv-v0", "seed": 0},
+        algo_config=config,
+        run_dir=tmp_path,
+    )
+
+    try:
+        partial_success = algorithm._evaluation_success_flags(
+            return_mean=99.0,
+            final_height_mean=1.0,
+            final_upright_mean=0.65,
+            max_height=1.2,
+        )
+        full_success = algorithm._evaluation_success_flags(
+            return_mean=100.0,
+            final_height_mean=1.0,
+            final_upright_mean=0.65,
+            max_height=1.2,
+        )
+    finally:
+        env.close()
+
+    assert partial_success == {
+        "return_success": False,
+        "height_success": True,
+        "upright_success": True,
+        "max_height_success": True,
+        "success": False,
+    }
+    assert full_success == {
+        "return_success": True,
+        "height_success": True,
+        "upright_success": True,
+        "max_height_success": True,
+        "success": True,
+    }
 
 
 def test_td3_tiny_smoke_run_writes_metrics_and_checkpoint(tmp_path: Path) -> None:

@@ -155,12 +155,15 @@ class RolloutBatch:
     log_probs: torch.Tensor
     rewards: torch.Tensor
     raw_rewards: torch.Tensor
+    shaped_rewards: torch.Tensor
     terminations: torch.Tensor
     dones: torch.Tensor
     values: torch.Tensor
     next_values: torch.Tensor
     episode_returns: list[float]
+    env_episode_returns: list[float]
     episode_lengths: list[int]
+    episode_successes: list[bool]
     diagnostics: dict[str, float]
     advantages: torch.Tensor | None = None
     returns: torch.Tensor | None = None
@@ -297,6 +300,21 @@ class PPO(Algorithm):
         self.torso_upright_weight = float(
             torso_upright_config.get("weight", 0.0)
         )
+        self.torso_upright_active_pelvis_height_threshold = float(
+            torso_upright_config.get("active_pelvis_height_threshold", 0.75)
+        )
+        self.torso_upright_upright_threshold = float(
+            torso_upright_config.get("upright_threshold", 0.7)
+        )
+        if not -1.0 <= self.torso_upright_upright_threshold < 1.0:
+            raise ValueError(
+                "PPO torso upright reward shaping upright_threshold must be in [-1, 1)."
+            )
+        self.torso_upright_positive_only = bool(
+            torso_upright_config.get("positive_only", True)
+        )
+        standup_hold_config = reward_shaping_config.get("standup_hold", {})
+        self.standup_hold_weight = float(standup_hold_config.get("weight", 0.0))
         abdomen_force_config = reward_shaping_config.get("abdomen_force", {})
         self.abdomen_force_weight = float(abdomen_force_config.get("weight", 0.0))
         abdomen_force_clip = abdomen_force_config.get("clip", 100.0)
@@ -313,15 +331,153 @@ class PPO(Algorithm):
         self.abdomen_force_upright_threshold = float(
             abdomen_force_config.get("torso_upright_threshold", 0.8)
         )
+        sway_penalty_config = reward_shaping_config.get("sway_penalty", {})
+        self.sway_penalty_weight = float(sway_penalty_config.get("weight", 0.0))
+        self.sway_penalty_active_pelvis_height_threshold = float(
+            sway_penalty_config.get("active_pelvis_height_threshold", 0.75)
+        )
+        self.sway_penalty_torso_angular_speed_tolerance = float(
+            sway_penalty_config.get("torso_angular_speed_tolerance", 1.0)
+        )
+        self.sway_penalty_pelvis_horizontal_speed_tolerance = float(
+            sway_penalty_config.get("pelvis_horizontal_speed_tolerance", 0.5)
+        )
+        self.sway_penalty_pelvis_vertical_speed_tolerance = float(
+            sway_penalty_config.get("pelvis_vertical_speed_tolerance", 0.4)
+        )
+        self.sway_penalty_torso_angular_speed_coef = float(
+            sway_penalty_config.get("torso_angular_speed_coef", 1.0)
+        )
+        self.sway_penalty_pelvis_horizontal_speed_coef = float(
+            sway_penalty_config.get("pelvis_horizontal_speed_coef", 0.5)
+        )
+        self.sway_penalty_pelvis_vertical_speed_coef = float(
+            sway_penalty_config.get("pelvis_vertical_speed_coef", 0.25)
+        )
+        support_balance_config = reward_shaping_config.get("support_balance", {})
+        self.support_balance_weight = float(support_balance_config.get("weight", 0.0))
+        self.support_balance_active_pelvis_height_threshold = float(
+            support_balance_config.get("active_pelvis_height_threshold", 0.6)
+        )
+        self.support_balance_torso_horizontal_tolerance = float(
+            support_balance_config.get("torso_horizontal_tolerance", 0.08)
+        )
+        if self.support_balance_torso_horizontal_tolerance <= 0.0:
+            raise ValueError(
+                "PPO support balance torso_horizontal_tolerance must be positive."
+            )
+        dual_support_symmetry_config = reward_shaping_config.get(
+            "dual_support_symmetry",
+            {},
+        )
+        self.dual_support_symmetry_weight = float(
+            dual_support_symmetry_config.get("weight", 0.0)
+        )
+        self.dual_support_symmetry_active_pelvis_height_threshold = float(
+            dual_support_symmetry_config.get("active_pelvis_height_threshold", 0.55)
+        )
+        self.dual_support_symmetry_foot_height_tolerance = float(
+            dual_support_symmetry_config.get("foot_height_tolerance", 0.04)
+        )
+        if self.dual_support_symmetry_foot_height_tolerance <= 0.0:
+            raise ValueError(
+                "PPO dual support symmetry foot_height_tolerance must be positive."
+            )
+        self.dual_support_symmetry_torso_lateral_tolerance = float(
+            dual_support_symmetry_config.get("torso_lateral_tolerance", 0.06)
+        )
+        if self.dual_support_symmetry_torso_lateral_tolerance <= 0.0:
+            raise ValueError(
+                "PPO dual support symmetry torso_lateral_tolerance must be positive."
+            )
+        self.dual_support_symmetry_foot_height_coef = float(
+            dual_support_symmetry_config.get("foot_height_coef", 1.0)
+        )
+        self.dual_support_symmetry_torso_lateral_coef = float(
+            dual_support_symmetry_config.get("torso_lateral_coef", 0.5)
+        )
+        if self.dual_support_symmetry_foot_height_coef < 0.0:
+            raise ValueError(
+                "PPO dual support symmetry foot_height_coef must be non-negative."
+            )
+        if self.dual_support_symmetry_torso_lateral_coef < 0.0:
+            raise ValueError(
+                "PPO dual support symmetry torso_lateral_coef must be non-negative."
+            )
         leg_vertical_angle_config = reward_shaping_config.get("leg_vertical_angle", {})
         self.leg_vertical_angle_weight = float(
             leg_vertical_angle_config.get("weight", 0.0)
         )
+        delayed_rewards_config = reward_shaping_config.get("delayed_rewards", {})
+        delayed_knee_height_config = delayed_rewards_config.get("knee_height", {})
+        self.delayed_knee_height_weight = float(
+            delayed_knee_height_config.get("weight", 0.0)
+        )
+        self.delayed_knee_height_delay_seconds = float(
+            delayed_knee_height_config.get("delay_seconds", 0.0)
+        )
+        if self.delayed_knee_height_delay_seconds < 0.0:
+            raise ValueError(
+                "PPO delayed knee height reward shaping delay_seconds must be non-negative."
+            )
+        delayed_knee_height_clip = delayed_knee_height_config.get("clip")
+        self.delayed_knee_height_clip = (
+            None if delayed_knee_height_clip is None else float(delayed_knee_height_clip)
+        )
+        if self.delayed_knee_height_clip is not None and self.delayed_knee_height_clip <= 0.0:
+            raise ValueError("PPO delayed knee height reward shaping clip must be positive.")
+        delayed_hip_height_config = delayed_rewards_config.get("hip_height", {})
+        self.delayed_hip_height_weight = float(
+            delayed_hip_height_config.get("weight", 0.0)
+        )
+        self.delayed_hip_height_delay_seconds = float(
+            delayed_hip_height_config.get("delay_seconds", 0.0)
+        )
+        if self.delayed_hip_height_delay_seconds < 0.0:
+            raise ValueError(
+                "PPO delayed hip height reward shaping delay_seconds must be non-negative."
+            )
+        delayed_hip_height_clip = delayed_hip_height_config.get("clip")
+        self.delayed_hip_height_clip = (
+            None if delayed_hip_height_clip is None else float(delayed_hip_height_clip)
+        )
+        if self.delayed_hip_height_clip is not None and self.delayed_hip_height_clip <= 0.0:
+            raise ValueError("PPO delayed hip height reward shaping clip must be positive.")
+        delayed_leg_vertical_angle_config = delayed_rewards_config.get(
+            "leg_vertical_angle",
+            {},
+        )
+        self.delayed_leg_vertical_angle_weight = float(
+            delayed_leg_vertical_angle_config.get("weight", 0.0)
+        )
+        self.delayed_leg_vertical_angle_delay_seconds = float(
+            delayed_leg_vertical_angle_config.get("delay_seconds", 0.0)
+        )
+        if self.delayed_leg_vertical_angle_delay_seconds < 0.0:
+            raise ValueError(
+                "PPO delayed leg vertical angle reward shaping delay_seconds "
+                "must be non-negative."
+            )
+        standup_success_config = reward_shaping_config.get("standup_success", {})
+        self.standup_success_pelvis_height_threshold = float(
+            standup_success_config.get("pelvis_height_threshold", 0.9)
+        )
+        self.standup_success_torso_upright_threshold = float(
+            standup_success_config.get("torso_upright_threshold", 0.85)
+        )
+        self.standup_success_sustain_seconds = float(
+            standup_success_config.get("sustain_seconds", 0.5)
+        )
+        if self.standup_success_sustain_seconds < 0.0:
+            raise ValueError("PPO standup success sustain_seconds must be non-negative.")
 
         requested_device = str(self.algo_config.get("device", "auto"))
         if requested_device == "auto":
             requested_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(requested_device)
+        self.env_dt_seconds = self._resolve_env_dt_seconds()
+        sustain_steps = int(np.ceil(self.standup_success_sustain_seconds / self.env_dt_seconds))
+        self.standup_success_sustain_steps = max(1, sustain_steps)
 
         self.rollout_buffer: RolloutBatch | None = None
         self.policy_network: PolicyNetwork | None = None
@@ -330,7 +486,10 @@ class PPO(Algorithm):
         self.metrics: dict[str, Any] = {}
         self._last_observation: np.ndarray | None = None
         self._current_episode_return = np.zeros(self.num_envs, dtype=np.float64)
+        self._current_env_episode_return = np.zeros(self.num_envs, dtype=np.float64)
         self._current_episode_length = np.zeros(self.num_envs, dtype=np.int64)
+        self._current_episode_success = np.zeros(self.num_envs, dtype=np.bool_)
+        self._current_success_streak = np.zeros(self.num_envs, dtype=np.int64)
         self._discounted_return = np.zeros(self.num_envs, dtype=np.float64)
         self.global_step = 0
         self._resume_loaded = False
@@ -372,7 +531,10 @@ class PPO(Algorithm):
         self._last_observation, _ = self.env.reset(seed=self.seed)
         self._last_observation = self._as_observation_batch(self._last_observation)
         self._current_episode_return = np.zeros(self.num_envs, dtype=np.float64)
+        self._current_env_episode_return = np.zeros(self.num_envs, dtype=np.float64)
         self._current_episode_length = np.zeros(self.num_envs, dtype=np.int64)
+        self._current_episode_success = np.zeros(self.num_envs, dtype=np.bool_)
+        self._current_success_streak = np.zeros(self.num_envs, dtype=np.int64)
         self._discounted_return = np.zeros(self.num_envs, dtype=np.float64)
         if not self._resume_loaded:
             self.global_step = 0
@@ -427,12 +589,15 @@ class PPO(Algorithm):
         log_probs: list[np.ndarray] = []
         rewards: list[np.ndarray] = []
         raw_rewards: list[np.ndarray] = []
+        shaped_rewards: list[np.ndarray] = []
         terminations: list[np.ndarray] = []
         dones: list[np.ndarray] = []
         values: list[np.ndarray] = []
         next_values: list[np.ndarray] = []
         episode_returns: list[float] = []
+        env_episode_returns: list[float] = []
         episode_lengths: list[int] = []
+        episode_successes: list[bool] = []
         diagnostics: dict[str, list[float]] = {
             "z_distance_from_origin": [],
             "reward_linup": [],
@@ -440,6 +605,7 @@ class PPO(Algorithm):
             "reward_impact": [],
             "knee_z": [],
             "reward_knee": [],
+            "knee_height_delay_gate": [],
             "knee_force": [],
             "reward_knee_force": [],
             "right_knee_angle": [],
@@ -450,8 +616,25 @@ class PPO(Algorithm):
             "hip_speed": [],
             "reward_hip_height": [],
             "reward_hip_velocity": [],
+            "hip_height_delay_gate": [],
             "torso_upright": [],
+            "torso_upright_gate": [],
             "reward_torso_upright": [],
+            "standup_success_signal": [],
+            "standup_success_sustained": [],
+            "reward_standup_hold": [],
+            "torso_angular_speed": [],
+            "pelvis_horizontal_speed": [],
+            "pelvis_vertical_speed": [],
+            "sway_penalty_gate": [],
+            "reward_sway_penalty": [],
+            "support_balance_offset": [],
+            "support_balance_gate": [],
+            "reward_support_balance": [],
+            "dual_support_foot_height_asymmetry": [],
+            "dual_support_torso_lateral_offset": [],
+            "dual_support_gate": [],
+            "reward_dual_support_symmetry": [],
             "abdomen_force": [],
             "abdomen_force_gate": [],
             "reward_abdomen_force": [],
@@ -459,6 +642,7 @@ class PPO(Algorithm):
             "left_leg_vertical_angle": [],
             "leg_vertical_angle": [],
             "reward_leg_vertical_angle": [],
+            "leg_vertical_angle_delay_gate": [],
             "raw_action_mean": [],
             "raw_action_std": [],
             "env_action_mean": [],
@@ -480,8 +664,13 @@ class PPO(Algorithm):
             next_observation, reward, terminated, truncated, info = self.env.step(env_action)
 
             next_observation_batch = self._as_observation_batch(next_observation)
-            reward_array = np.asarray(reward, dtype=np.float32).reshape(self.num_envs)
-            knee_z_array, knee_reward_array = self._knee_height_reward_batch()
+            env_reward_array = np.asarray(reward, dtype=np.float32).reshape(self.num_envs)
+            reward_array = env_reward_array.copy()
+            (
+                knee_z_array,
+                knee_reward_array,
+                knee_height_delay_gate_array,
+            ) = self._knee_height_reward_batch()
             knee_force_array, knee_force_reward_array = (
                 self._knee_force_reward_batch()
             )
@@ -496,10 +685,40 @@ class PPO(Algorithm):
                 hip_speed_array,
                 hip_height_reward_array,
                 hip_velocity_reward_array,
+                hip_height_delay_gate_array,
             ) = self._hip_reward_batch()
-            torso_upright_array, torso_upright_reward_array = (
+            (
+                torso_upright_array,
+                torso_upright_gate_array,
+                torso_upright_reward_array,
+            ) = (
                 self._torso_upright_reward_batch()
             )
+            standup_success_signal_array = self._standup_success_signal_batch()
+            standup_success_sustained_array = self._update_standup_success_tracking(
+                standup_success_signal_array
+            )
+            standup_hold_reward_array = (
+                self.standup_hold_weight * standup_success_sustained_array
+            ).astype(np.float32, copy=False)
+            (
+                torso_angular_speed_array,
+                pelvis_horizontal_speed_array,
+                pelvis_vertical_speed_array,
+                sway_penalty_gate_array,
+                sway_penalty_reward_array,
+            ) = self._sway_penalty_batch(hip_z_array=hip_z_array)
+            (
+                support_balance_offset_array,
+                support_balance_gate_array,
+                support_balance_reward_array,
+            ) = self._support_balance_reward_batch(hip_z_array=hip_z_array)
+            (
+                dual_support_foot_height_asymmetry_array,
+                dual_support_torso_lateral_offset_array,
+                dual_support_gate_array,
+                dual_support_reward_array,
+            ) = self._dual_support_symmetry_reward_batch(hip_z_array=hip_z_array)
             (
                 abdomen_force_array,
                 abdomen_force_gate_array,
@@ -510,6 +729,7 @@ class PPO(Algorithm):
                 left_leg_angle_array,
                 leg_angle_array,
                 leg_angle_reward_array,
+                leg_angle_delay_gate_array,
             ) = self._leg_vertical_angle_reward_batch()
             reward_array = (
                 reward_array
@@ -519,11 +739,18 @@ class PPO(Algorithm):
                 + hip_height_reward_array
                 + hip_velocity_reward_array
                 + torso_upright_reward_array
+                + standup_hold_reward_array
+                + sway_penalty_reward_array
+                + support_balance_reward_array
+                + dual_support_reward_array
                 + abdomen_force_reward_array
                 + leg_angle_reward_array
             )
             diagnostics["knee_z"].extend(float(value) for value in knee_z_array)
             diagnostics["reward_knee"].extend(float(value) for value in knee_reward_array)
+            diagnostics["knee_height_delay_gate"].extend(
+                float(value) for value in knee_height_delay_gate_array
+            )
             diagnostics["knee_force"].extend(float(value) for value in knee_force_array)
             diagnostics["reward_knee_force"].extend(
                 float(value) for value in knee_force_reward_array
@@ -548,11 +775,62 @@ class PPO(Algorithm):
             diagnostics["reward_hip_velocity"].extend(
                 float(value) for value in hip_velocity_reward_array
             )
+            diagnostics["hip_height_delay_gate"].extend(
+                float(value) for value in hip_height_delay_gate_array
+            )
             diagnostics["torso_upright"].extend(
                 float(value) for value in torso_upright_array
             )
+            diagnostics["torso_upright_gate"].extend(
+                float(value) for value in torso_upright_gate_array
+            )
             diagnostics["reward_torso_upright"].extend(
                 float(value) for value in torso_upright_reward_array
+            )
+            diagnostics["standup_success_signal"].extend(
+                float(value) for value in standup_success_signal_array
+            )
+            diagnostics["standup_success_sustained"].extend(
+                float(value) for value in standup_success_sustained_array
+            )
+            diagnostics["reward_standup_hold"].extend(
+                float(value) for value in standup_hold_reward_array
+            )
+            diagnostics["torso_angular_speed"].extend(
+                float(value) for value in torso_angular_speed_array
+            )
+            diagnostics["pelvis_horizontal_speed"].extend(
+                float(value) for value in pelvis_horizontal_speed_array
+            )
+            diagnostics["pelvis_vertical_speed"].extend(
+                float(value) for value in pelvis_vertical_speed_array
+            )
+            diagnostics["sway_penalty_gate"].extend(
+                float(value) for value in sway_penalty_gate_array
+            )
+            diagnostics["reward_sway_penalty"].extend(
+                float(value) for value in sway_penalty_reward_array
+            )
+            diagnostics["support_balance_offset"].extend(
+                float(value) for value in support_balance_offset_array
+            )
+            diagnostics["support_balance_gate"].extend(
+                float(value) for value in support_balance_gate_array
+            )
+            diagnostics["reward_support_balance"].extend(
+                float(value) for value in support_balance_reward_array
+            )
+            diagnostics["dual_support_foot_height_asymmetry"].extend(
+                float(value) for value in dual_support_foot_height_asymmetry_array
+            )
+            diagnostics["dual_support_torso_lateral_offset"].extend(
+                float(value) for value in dual_support_torso_lateral_offset_array
+            )
+            diagnostics["dual_support_gate"].extend(
+                float(value) for value in dual_support_gate_array
+            )
+            diagnostics["reward_dual_support_symmetry"].extend(
+                float(value) for value in dual_support_reward_array
             )
             diagnostics["abdomen_force"].extend(
                 float(value) for value in abdomen_force_array
@@ -575,6 +853,9 @@ class PPO(Algorithm):
             diagnostics["reward_leg_vertical_angle"].extend(
                 float(value) for value in leg_angle_reward_array
             )
+            diagnostics["leg_vertical_angle_delay_gate"].extend(
+                float(value) for value in leg_angle_delay_gate_array
+            )
             terminated_array = np.asarray(terminated, dtype=np.bool_).reshape(self.num_envs)
             truncated_array = np.asarray(truncated, dtype=np.bool_).reshape(self.num_envs)
             done_array = np.logical_or(terminated_array, truncated_array)
@@ -596,19 +877,25 @@ class PPO(Algorithm):
             actions.append(action_sample.action)
             log_probs.append(action_sample.log_prob)
             rewards.append(scaled_reward)
-            raw_rewards.append(reward_array)
+            raw_rewards.append(env_reward_array)
+            shaped_rewards.append(reward_array)
             terminations.append(terminated_array.astype(np.float32))
             dones.append(done_array.astype(np.float32))
             values.append(action_sample.value)
             next_values.append(transition_next_values)
 
             self._current_episode_return += reward_array
+            self._current_env_episode_return += env_reward_array
             self._current_episode_length += 1
 
             if np.any(done_array):
                 for env_index in np.flatnonzero(done_array):
                     episode_returns.append(float(self._current_episode_return[env_index]))
+                    env_episode_returns.append(
+                        float(self._current_env_episode_return[env_index])
+                    )
                     episode_lengths.append(int(self._current_episode_length[env_index]))
+                    episode_successes.append(bool(self._current_episode_success[env_index]))
 
                 if self.num_envs > 1:
                     next_observation, _ = self.env.reset(
@@ -620,7 +907,10 @@ class PPO(Algorithm):
                     next_observation_batch = self._as_observation_batch(next_observation)
 
                 self._current_episode_return[done_array] = 0.0
+                self._current_env_episode_return[done_array] = 0.0
                 self._current_episode_length[done_array] = 0
+                self._current_episode_success[done_array] = False
+                self._current_success_streak[done_array] = 0
 
             self._last_observation = next_observation_batch
 
@@ -650,6 +940,11 @@ class PPO(Algorithm):
                 dtype=torch.float32,
                 device=self.device,
             ),
+            shaped_rewards=torch.as_tensor(
+                np.asarray(shaped_rewards),
+                dtype=torch.float32,
+                device=self.device,
+            ),
             terminations=torch.as_tensor(
                 np.asarray(terminations),
                 dtype=torch.float32,
@@ -671,7 +966,9 @@ class PPO(Algorithm):
                 device=self.device,
             ),
             episode_returns=episode_returns,
+            env_episode_returns=env_episode_returns,
             episode_lengths=episode_lengths,
+            episode_successes=episode_successes,
             diagnostics=self._summarize_diagnostics(diagnostics),
         )
 
@@ -770,6 +1067,10 @@ class PPO(Algorithm):
                 "advantages_std": float(advantages.std(unbiased=False).item()),
                 "raw_rewards_mean": float(buffer.raw_rewards.mean().item()),
                 "raw_rewards_std": float(buffer.raw_rewards.std(unbiased=False).item()),
+                "shaped_rewards_mean": float(buffer.shaped_rewards.mean().item()),
+                "shaped_rewards_std": float(
+                    buffer.shaped_rewards.std(unbiased=False).item()
+                ),
                 "scaled_rewards_mean": float(rewards.mean().item()),
                 "scaled_rewards_std": float(rewards.std(unbiased=False).item()),
                 "termination_fraction": float(terminations.mean().item()),
@@ -994,7 +1295,9 @@ class PPO(Algorithm):
         update = update_index + 1
         buffer = self.rollout_buffer
         complete_episode_returns = buffer.episode_returns
+        complete_env_episode_returns = buffer.env_episode_returns
         complete_episode_lengths = buffer.episode_lengths
+        complete_episode_successes = buffer.episode_successes
 
         record: dict[str, Any] = {
             "update": update,
@@ -1008,8 +1311,14 @@ class PPO(Algorithm):
             record["episode_return_mean"] = float(np.mean(complete_episode_returns))
             record["episode_return_min"] = float(np.min(complete_episode_returns))
             record["episode_return_max"] = float(np.max(complete_episode_returns))
+        if complete_env_episode_returns:
+            record["env_episode_return_mean"] = float(np.mean(complete_env_episode_returns))
+            record["env_episode_return_min"] = float(np.min(complete_env_episode_returns))
+            record["env_episode_return_max"] = float(np.max(complete_env_episode_returns))
         if complete_episode_lengths:
             record["episode_length_mean"] = float(np.mean(complete_episode_lengths))
+        if complete_episode_successes:
+            record["episode_success_rate"] = float(np.mean(complete_episode_successes))
 
         with self.metrics_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, sort_keys=True) + "\n")
@@ -1020,6 +1329,16 @@ class PPO(Algorithm):
                 episode_text = (
                     f" episode_return={record['episode_return_mean']:.2f}"
                 )
+            env_episode_text = ""
+            if complete_env_episode_returns:
+                env_episode_text = (
+                    f" env_episode_return={record['env_episode_return_mean']:.2f}"
+                )
+            success_text = ""
+            if complete_episode_successes:
+                success_text = (
+                    f" success_rate={record['episode_success_rate']:.3f}"
+                )
             print(
                 f"update={update}/{self.num_updates} "
                 f"step={self.global_step} "
@@ -1028,6 +1347,8 @@ class PPO(Algorithm):
                 f"entropy={record.get('entropy', 0.0):.4f} "
                 f"kl={record.get('approx_kl', 0.0):.6f}"
                 f"{episode_text}"
+                f"{env_episode_text}"
+                f"{success_text}"
             )
 
     def _maybe_save_checkpoint(self, update_index: int) -> None:
@@ -1102,7 +1423,6 @@ class PPO(Algorithm):
 
         self.policy_network.load_state_dict(checkpoint["policy_network"])
         self.value_network.load_state_dict(checkpoint["value_network"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.global_step = int(checkpoint.get("global_step", 0))
         self._resume_loaded = True
         normalization_state = checkpoint.get("normalization", {})
@@ -1189,10 +1509,63 @@ class PPO(Algorithm):
         ).sum(dim=-1)
         return base_log_prob - tanh_log_det - self._action_log_scale_sum
 
-    def _knee_height_reward_batch(self) -> tuple[np.ndarray, np.ndarray]:
+    def _pelvis_state_batch(self) -> tuple[np.ndarray, np.ndarray]:
+        hip_z = np.zeros(self.num_envs, dtype=np.float32)
+        hip_speed = np.zeros(self.num_envs, dtype=np.float32)
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                pelvis_id = env.model.body("pelvis").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO hip reward shaping requires a MuJoCo body named 'pelvis'."
+                ) from error
+
+            linear_velocity = np.asarray(env.data.cvel[pelvis_id, 3:6], dtype=np.float64)
+            hip_z[env_index] = float(env.data.xipos[pelvis_id, 2])
+            hip_speed[env_index] = float(np.linalg.norm(linear_velocity))
+
+        return hip_z, hip_speed
+
+    def _torso_upright_batch(self) -> np.ndarray:
+        torso_upright = np.zeros(self.num_envs, dtype=np.float32)
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                torso_id = env.model.body("torso").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO torso upright reward shaping requires a MuJoCo body "
+                    "named 'torso'."
+                ) from error
+
+            torso_upright[env_index] = float(env.data.xmat[torso_id, 8])
+
+        return torso_upright
+
+    def _torso_angular_speed_batch(self) -> np.ndarray:
+        torso_angular_speed = np.zeros(self.num_envs, dtype=np.float32)
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                torso_id = env.model.body("torso").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO sway penalty requires a MuJoCo body named 'torso'."
+                ) from error
+
+            angular_velocity = np.asarray(env.data.cvel[torso_id, 0:3], dtype=np.float64)
+            torso_angular_speed[env_index] = float(np.linalg.norm(angular_velocity))
+
+        return torso_angular_speed
+
+    def _knee_height_reward_batch(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         knee_z = np.zeros(self.num_envs, dtype=np.float32)
-        if self.knee_height_weight == 0.0:
-            return knee_z, knee_z.copy()
+        knee_height_delay_gate = np.zeros(self.num_envs, dtype=np.float32)
+        if self.knee_height_weight == 0.0 and self.delayed_knee_height_weight == 0.0:
+            return knee_z, knee_z.copy(), knee_height_delay_gate
 
         for env_index, env in enumerate(self._unwrapped_envs()):
             try:
@@ -1208,8 +1581,25 @@ class PPO(Algorithm):
             left_knee_z = float(env.data.xanchor[left_knee_id, 2])
             knee_z[env_index] = 0.5 * (right_knee_z + left_knee_z)
 
-        knee_reward = self.knee_height_weight * knee_z / self.knee_height_dt
-        return knee_z, knee_reward.astype(np.float32, copy=False)
+        knee_base_reward = knee_z / self.knee_height_dt
+        knee_reward = self.knee_height_weight * knee_base_reward
+        if self.delayed_knee_height_weight != 0.0:
+            knee_height_delay_gate = self._reward_delay_gate_batch(
+                delay_seconds=self.delayed_knee_height_delay_seconds
+            )
+            delayed_knee_z = knee_z
+            if self.delayed_knee_height_clip is not None:
+                delayed_knee_z = np.minimum(delayed_knee_z, self.delayed_knee_height_clip)
+            knee_reward = knee_reward + (
+                self.delayed_knee_height_weight
+                * (delayed_knee_z / self.knee_height_dt)
+                * knee_height_delay_gate
+            )
+        return (
+            knee_z,
+            knee_reward.astype(np.float32, copy=False),
+            knee_height_delay_gate,
+        )
 
     def _knee_force_reward_batch(self) -> tuple[np.ndarray, np.ndarray]:
         knee_force = np.zeros(self.num_envs, dtype=np.float32)
@@ -1281,53 +1671,273 @@ class PPO(Algorithm):
 
     def _hip_reward_batch(
         self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         hip_z = np.zeros(self.num_envs, dtype=np.float32)
         hip_speed = np.zeros(self.num_envs, dtype=np.float32)
-        if self.hip_height_weight == 0.0 and self.hip_velocity_weight == 0.0:
-            return hip_z, hip_speed, hip_z.copy(), hip_speed.copy()
+        hip_height_delay_gate = np.zeros(self.num_envs, dtype=np.float32)
+        if (
+            self.hip_height_weight == 0.0
+            and self.hip_velocity_weight == 0.0
+            and self.delayed_hip_height_weight == 0.0
+        ):
+            return hip_z, hip_speed, hip_z.copy(), hip_speed.copy(), hip_height_delay_gate
 
-        for env_index, env in enumerate(self._unwrapped_envs()):
-            try:
-                pelvis_id = env.model.body("pelvis").id
-            except KeyError as error:
-                raise ValueError(
-                    "PPO hip reward shaping requires a MuJoCo body named 'pelvis'."
-                ) from error
+        hip_z, hip_speed = self._pelvis_state_batch()
 
-            linear_velocity = np.asarray(env.data.cvel[pelvis_id, 3:6], dtype=np.float64)
-            hip_z[env_index] = float(env.data.xipos[pelvis_id, 2])
-            hip_speed[env_index] = float(np.linalg.norm(linear_velocity))
-
-        hip_height_reward = self.hip_height_weight * hip_z / self.hip_height_dt
+        hip_height_base_reward = hip_z / self.hip_height_dt
+        hip_height_reward = self.hip_height_weight * hip_height_base_reward
+        if self.delayed_hip_height_weight != 0.0:
+            hip_height_delay_gate = self._reward_delay_gate_batch(
+                delay_seconds=self.delayed_hip_height_delay_seconds
+            )
+            delayed_hip_z = hip_z
+            if self.delayed_hip_height_clip is not None:
+                delayed_hip_z = np.minimum(delayed_hip_z, self.delayed_hip_height_clip)
+            hip_height_reward = hip_height_reward + (
+                self.delayed_hip_height_weight
+                * (delayed_hip_z / self.hip_height_dt)
+                * hip_height_delay_gate
+            )
         hip_velocity_reward = -self.hip_velocity_weight * np.square(hip_speed)
         return (
             hip_z,
             hip_speed,
             hip_height_reward.astype(np.float32, copy=False),
             hip_velocity_reward.astype(np.float32, copy=False),
+            hip_height_delay_gate,
         )
 
-    def _torso_upright_reward_batch(self) -> tuple[np.ndarray, np.ndarray]:
+    def _standing_gate_batch(
+        self,
+        *,
+        hip_z_array: np.ndarray | None = None,
+        threshold: float,
+    ) -> np.ndarray:
+        if hip_z_array is None:
+            hip_z_array, _ = self._pelvis_state_batch()
+        return (hip_z_array >= threshold).astype(np.float32)
+
+    def _torso_upright_reward_batch(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         torso_upright = np.zeros(self.num_envs, dtype=np.float32)
+        torso_upright_gate = np.zeros(self.num_envs, dtype=np.float32)
         if self.torso_upright_weight == 0.0:
-            return torso_upright, torso_upright.copy()
+            return torso_upright, torso_upright_gate, torso_upright.copy()
+
+        hip_z_array, _ = self._pelvis_state_batch()
+        torso_upright = self._torso_upright_batch()
+        torso_upright_gate = self._standing_gate_batch(
+            hip_z_array=hip_z_array,
+            threshold=self.torso_upright_active_pelvis_height_threshold,
+        )
+        torso_measure = torso_upright
+        if self.torso_upright_positive_only:
+            torso_measure = np.maximum(
+                torso_measure - self.torso_upright_upright_threshold,
+                0.0,
+            )
+            torso_measure = torso_measure / max(
+                1.0 - self.torso_upright_upright_threshold,
+                1e-6,
+            )
+        else:
+            torso_measure = torso_measure - self.torso_upright_upright_threshold
+        torso_upright_reward = (
+            self.torso_upright_weight
+            * torso_measure
+            * torso_upright_gate
+        )
+        return (
+            torso_upright,
+            torso_upright_gate,
+            torso_upright_reward.astype(np.float32, copy=False),
+        )
+
+    def _sway_penalty_batch(
+        self,
+        *,
+        hip_z_array: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        torso_angular_speed = np.zeros(self.num_envs, dtype=np.float32)
+        pelvis_horizontal_speed = np.zeros(self.num_envs, dtype=np.float32)
+        pelvis_vertical_speed = np.zeros(self.num_envs, dtype=np.float32)
+        sway_penalty_gate = np.zeros(self.num_envs, dtype=np.float32)
+        if self.sway_penalty_weight == 0.0:
+            return (
+                torso_angular_speed,
+                pelvis_horizontal_speed,
+                pelvis_vertical_speed,
+                sway_penalty_gate,
+                torso_angular_speed.copy(),
+            )
+
+        if hip_z_array is None:
+            hip_z_array, _ = self._pelvis_state_batch()
+        sway_penalty_gate = self._standing_gate_batch(
+            hip_z_array=hip_z_array,
+            threshold=self.sway_penalty_active_pelvis_height_threshold,
+        )
+        torso_angular_speed = self._torso_angular_speed_batch()
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                pelvis_id = env.model.body("pelvis").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO sway penalty requires a MuJoCo body named 'pelvis'."
+                ) from error
+
+            linear_velocity = np.asarray(env.data.cvel[pelvis_id, 3:6], dtype=np.float64)
+            pelvis_horizontal_speed[env_index] = float(np.linalg.norm(linear_velocity[0:2]))
+            pelvis_vertical_speed[env_index] = float(abs(linear_velocity[2]))
+
+        torso_angular_excess = np.maximum(
+            torso_angular_speed - self.sway_penalty_torso_angular_speed_tolerance,
+            0.0,
+        )
+        pelvis_horizontal_excess = np.maximum(
+            pelvis_horizontal_speed - self.sway_penalty_pelvis_horizontal_speed_tolerance,
+            0.0,
+        )
+        pelvis_vertical_excess = np.maximum(
+            pelvis_vertical_speed - self.sway_penalty_pelvis_vertical_speed_tolerance,
+            0.0,
+        )
+        sway_penalty = -self.sway_penalty_weight * sway_penalty_gate * (
+            self.sway_penalty_torso_angular_speed_coef * torso_angular_excess
+            + self.sway_penalty_pelvis_horizontal_speed_coef * pelvis_horizontal_excess
+            + self.sway_penalty_pelvis_vertical_speed_coef * pelvis_vertical_excess
+        )
+        return (
+            torso_angular_speed,
+            pelvis_horizontal_speed,
+            pelvis_vertical_speed,
+            sway_penalty_gate,
+            sway_penalty.astype(np.float32, copy=False),
+        )
+
+    def _support_balance_reward_batch(
+        self,
+        *,
+        hip_z_array: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        support_balance_offset = np.zeros(self.num_envs, dtype=np.float32)
+        support_balance_gate = np.zeros(self.num_envs, dtype=np.float32)
+        if self.support_balance_weight == 0.0:
+            return (
+                support_balance_offset,
+                support_balance_gate,
+                support_balance_offset.copy(),
+            )
+
+        if hip_z_array is None:
+            hip_z_array, _ = self._pelvis_state_batch()
+        support_balance_gate = self._standing_gate_batch(
+            hip_z_array=hip_z_array,
+            threshold=self.support_balance_active_pelvis_height_threshold,
+        )
 
         for env_index, env in enumerate(self._unwrapped_envs()):
             try:
                 torso_id = env.model.body("torso").id
+                right_foot_id = env.model.body("right_foot").id
+                left_foot_id = env.model.body("left_foot").id
             except KeyError as error:
                 raise ValueError(
-                    "PPO torso upright reward shaping requires a MuJoCo body "
-                    "named 'torso'."
+                    "PPO support balance requires bodies 'torso', 'right_foot', "
+                    "and 'left_foot'."
                 ) from error
 
-            torso_upright[env_index] = float(env.data.xmat[torso_id, 8])
+            torso_x = float(env.data.xipos[torso_id, 0])
+            foot_mid_x = float(
+                0.5
+                * (
+                    env.data.xipos[right_foot_id, 0]
+                    + env.data.xipos[left_foot_id, 0]
+                )
+            )
+            support_balance_offset[env_index] = torso_x - foot_mid_x
 
-        torso_upright_reward = self.torso_upright_weight * torso_upright
+        offset_excess = np.maximum(
+            np.abs(support_balance_offset) - self.support_balance_torso_horizontal_tolerance,
+            0.0,
+        )
+        normalized_offset_excess = offset_excess / max(
+            self.support_balance_torso_horizontal_tolerance,
+            1e-6,
+        )
+        support_balance_reward = (
+            -self.support_balance_weight
+            * support_balance_gate
+            * normalized_offset_excess
+        )
         return (
-            torso_upright,
-            torso_upright_reward.astype(np.float32, copy=False),
+            support_balance_offset,
+            support_balance_gate,
+            support_balance_reward.astype(np.float32, copy=False),
+        )
+
+    def _dual_support_symmetry_reward_batch(
+        self,
+        *,
+        hip_z_array: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        foot_height_asymmetry = np.zeros(self.num_envs, dtype=np.float32)
+        torso_lateral_offset = np.zeros(self.num_envs, dtype=np.float32)
+        dual_support_gate = np.zeros(self.num_envs, dtype=np.float32)
+        if self.dual_support_symmetry_weight == 0.0:
+            return (
+                foot_height_asymmetry,
+                torso_lateral_offset,
+                dual_support_gate,
+                foot_height_asymmetry.copy(),
+            )
+
+        if hip_z_array is None:
+            hip_z_array, _ = self._pelvis_state_batch()
+        dual_support_gate = self._standing_gate_batch(
+            hip_z_array=hip_z_array,
+            threshold=self.dual_support_symmetry_active_pelvis_height_threshold,
+        )
+
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            try:
+                torso_id = env.model.body("torso").id
+                right_foot_id = env.model.body("right_foot").id
+                left_foot_id = env.model.body("left_foot").id
+            except KeyError as error:
+                raise ValueError(
+                    "PPO dual support symmetry requires bodies 'torso', "
+                    "'right_foot', and 'left_foot'."
+                ) from error
+
+            torso_position = np.asarray(env.data.xipos[torso_id], dtype=np.float64)
+            right_foot_position = np.asarray(env.data.xipos[right_foot_id], dtype=np.float64)
+            left_foot_position = np.asarray(env.data.xipos[left_foot_id], dtype=np.float64)
+            foot_height_asymmetry[env_index] = float(
+                abs(right_foot_position[2] - left_foot_position[2])
+            )
+            foot_mid_y = float(0.5 * (right_foot_position[1] + left_foot_position[1]))
+            torso_lateral_offset[env_index] = float(torso_position[1] - foot_mid_y)
+
+        foot_height_excess = np.maximum(
+            foot_height_asymmetry - self.dual_support_symmetry_foot_height_tolerance,
+            0.0,
+        ) / max(self.dual_support_symmetry_foot_height_tolerance, 1e-6)
+        torso_lateral_excess = np.maximum(
+            np.abs(torso_lateral_offset) - self.dual_support_symmetry_torso_lateral_tolerance,
+            0.0,
+        ) / max(self.dual_support_symmetry_torso_lateral_tolerance, 1e-6)
+        dual_support_reward = -self.dual_support_symmetry_weight * dual_support_gate * (
+            self.dual_support_symmetry_foot_height_coef * foot_height_excess
+            + self.dual_support_symmetry_torso_lateral_coef * torso_lateral_excess
+        )
+        return (
+            foot_height_asymmetry,
+            torso_lateral_offset,
+            dual_support_gate,
+            dual_support_reward.astype(np.float32, copy=False),
         )
 
     def _abdomen_force_reward_batch(
@@ -1369,12 +1979,22 @@ class PPO(Algorithm):
 
     def _leg_vertical_angle_reward_batch(
         self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         right_angle = np.zeros(self.num_envs, dtype=np.float32)
         left_angle = np.zeros(self.num_envs, dtype=np.float32)
         mean_angle = np.zeros(self.num_envs, dtype=np.float32)
-        if self.leg_vertical_angle_weight == 0.0:
-            return right_angle, left_angle, mean_angle, mean_angle.copy()
+        leg_vertical_angle_delay_gate = np.zeros(self.num_envs, dtype=np.float32)
+        if (
+            self.leg_vertical_angle_weight == 0.0
+            and self.delayed_leg_vertical_angle_weight == 0.0
+        ):
+            return (
+                right_angle,
+                left_angle,
+                mean_angle,
+                mean_angle.copy(),
+                leg_vertical_angle_delay_gate,
+            )
 
         for env_index, env in enumerate(self._unwrapped_envs()):
             right_angle[env_index] = self._leg_vertical_angle(
@@ -1392,11 +2012,21 @@ class PPO(Algorithm):
             )
 
         angle_reward = -self.leg_vertical_angle_weight * mean_angle
+        if self.delayed_leg_vertical_angle_weight != 0.0:
+            leg_vertical_angle_delay_gate = self._reward_delay_gate_batch(
+                delay_seconds=self.delayed_leg_vertical_angle_delay_seconds
+            )
+            angle_reward = angle_reward - (
+                self.delayed_leg_vertical_angle_weight
+                * mean_angle
+                * leg_vertical_angle_delay_gate
+            )
         return (
             right_angle,
             left_angle,
             mean_angle,
             angle_reward.astype(np.float32, copy=False),
+            leg_vertical_angle_delay_gate,
         )
 
     def _leg_vertical_angle(
@@ -1432,6 +2062,62 @@ class PPO(Algorithm):
         if envs is None:
             return [self.env.unwrapped]
         return [env.unwrapped for env in envs]
+
+    def _resolve_env_dt_seconds(self) -> float:
+        env = self._unwrapped_envs()[0]
+        dt = getattr(env, "dt", None)
+        if dt is None:
+            model = getattr(env, "model", None)
+            opt = getattr(model, "opt", None)
+            timestep = getattr(opt, "timestep", None)
+            frame_skip = getattr(env, "frame_skip", None)
+            if timestep is not None and frame_skip is not None:
+                dt = float(timestep) * float(frame_skip)
+        if dt is None or float(dt) <= 0.0:
+            raise ValueError("PPO reward shaping requires a positive environment dt.")
+        return float(dt)
+
+    def _reward_delay_gate_batch(self, *, delay_seconds: float) -> np.ndarray:
+        if delay_seconds <= 0.0:
+            return np.ones(self.num_envs, dtype=np.float32)
+        elapsed_seconds = (
+            self._current_episode_length.astype(np.float32) + 1.0
+        ) * self.env_dt_seconds
+        return (elapsed_seconds >= delay_seconds).astype(np.float32)
+
+    def _standup_success_signal_batch(
+        self,
+        *,
+        hip_z_array: np.ndarray | None = None,
+        torso_upright_array: np.ndarray | None = None,
+    ) -> np.ndarray:
+        if hip_z_array is None:
+            hip_z_array, _ = self._pelvis_state_batch()
+        if torso_upright_array is None:
+            torso_upright_array = self._torso_upright_batch()
+        return np.logical_and(
+            hip_z_array >= self.standup_success_pelvis_height_threshold,
+            torso_upright_array >= self.standup_success_torso_upright_threshold,
+        )
+
+    def _update_standup_success_tracking(
+        self,
+        success_signal: np.ndarray,
+    ) -> np.ndarray:
+        success_signal = np.asarray(success_signal, dtype=np.bool_).reshape(self.num_envs)
+        self._current_success_streak = np.where(
+            success_signal,
+            self._current_success_streak + 1,
+            0,
+        )
+        sustained_success = (
+            self._current_success_streak >= self.standup_success_sustain_steps
+        )
+        self._current_episode_success = np.logical_or(
+            self._current_episode_success,
+            sustained_success,
+        )
+        return sustained_success.astype(np.float32)
 
     def _record_rollout_diagnostics(
         self,
@@ -1480,6 +2166,7 @@ class PPO(Algorithm):
                 "reward_linup",
                 "knee_z",
                 "reward_knee",
+                "knee_height_delay_gate",
                 "knee_force",
                 "reward_knee_force",
                 "right_knee_angle",
@@ -1490,8 +2177,25 @@ class PPO(Algorithm):
                 "hip_speed",
                 "reward_hip_height",
                 "reward_hip_velocity",
+                "hip_height_delay_gate",
                 "torso_upright",
+                "torso_upright_gate",
                 "reward_torso_upright",
+                "standup_success_signal",
+                "standup_success_sustained",
+                "reward_standup_hold",
+                "torso_angular_speed",
+                "pelvis_horizontal_speed",
+                "pelvis_vertical_speed",
+                "sway_penalty_gate",
+                "reward_sway_penalty",
+                "support_balance_offset",
+                "support_balance_gate",
+                "reward_support_balance",
+                "dual_support_foot_height_asymmetry",
+                "dual_support_torso_lateral_offset",
+                "dual_support_gate",
+                "reward_dual_support_symmetry",
                 "abdomen_force",
                 "abdomen_force_gate",
                 "reward_abdomen_force",
@@ -1499,6 +2203,7 @@ class PPO(Algorithm):
                 "left_leg_vertical_angle",
                 "leg_vertical_angle",
                 "reward_leg_vertical_angle",
+                "leg_vertical_angle_delay_gate",
                 "raw_action_std",
                 "env_action_std",
                 "action_abs_mean",
@@ -1512,6 +2217,7 @@ class PPO(Algorithm):
                 "reward_impact",
                 "knee_z",
                 "reward_knee",
+                "knee_height_delay_gate",
                 "knee_force",
                 "reward_knee_force",
                 "right_knee_angle",
@@ -1521,14 +2227,32 @@ class PPO(Algorithm):
                 "hip_z",
                 "reward_hip_height",
                 "reward_hip_velocity",
+                "hip_height_delay_gate",
                 "torso_upright",
+                "torso_upright_gate",
                 "reward_torso_upright",
+                "standup_success_signal",
+                "standup_success_sustained",
+                "reward_standup_hold",
+                "torso_angular_speed",
+                "pelvis_horizontal_speed",
+                "pelvis_vertical_speed",
+                "sway_penalty_gate",
+                "reward_sway_penalty",
+                "support_balance_offset",
+                "support_balance_gate",
+                "reward_support_balance",
+                "dual_support_foot_height_asymmetry",
+                "dual_support_torso_lateral_offset",
+                "dual_support_gate",
+                "reward_dual_support_symmetry",
                 "abdomen_force",
                 "reward_abdomen_force",
                 "right_leg_vertical_angle",
                 "left_leg_vertical_angle",
                 "leg_vertical_angle",
                 "reward_leg_vertical_angle",
+                "leg_vertical_angle_delay_gate",
             }:
                 summary[f"{key}_min"] = float(array.min())
         return summary

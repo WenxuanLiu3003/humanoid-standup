@@ -11,5 +11,6 @@ def test_env_config() -> None:
 
 
 def test_algorithm_configs_exist() -> None:
-    assert available_algorithms() == ["a2c", "ddpg", "ppo", "sac", "td3"]
+    assert available_algorithms() == ["a2c", "ddpg", "ppo", "sac", "td3", "trpo"]
     assert load_algorithm_config("ppo")["name"] == "ppo"
+    assert load_algorithm_config("trpo")["name"] == "trpo"

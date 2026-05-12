@@ -6,6 +6,7 @@ from algorithms.ddpg import DDPG
 from algorithms.ppo import PPO
 from algorithms.sac import SAC
 from algorithms.td3 import TD3
+from algorithms.trpo import TRPO
 
 
 ALGORITHMS: dict[str, type[Algorithm]] = {
@@ -14,6 +15,7 @@ ALGORITHMS: dict[str, type[Algorithm]] = {
     "ppo": PPO,
     "sac": SAC,
     "td3": TD3,
+    "trpo": TRPO,
 }
 
 

@@ -4,7 +4,7 @@ collection:
   num_envs: 16
 
 hyperparameters:
-  total_timesteps: 8000000
+  total_timesteps: 18000000
   buffer_size: 250000
   learning_starts: 1024
   random_steps: 2048
@@ -20,7 +20,7 @@ hyperparameters:
   target_policy_noise: 0.1
   target_noise_clip: 0.25
   exploration_noise_initial: 0.25
-  exploration_noise_final: 0.02
+  exploration_noise_final: 0.05
   exploration_fraction: 0.5
 
 network:
@@ -65,11 +65,25 @@ reward_shaping:
     base_reward: 300.0
     success_bonus: 100.0
     height_min: 0.55
-    height_target: 1.05
+    height_target: 1.15
     upright_min: 0.0
     upright_target: 0.65
+  full_extension:
+    weight: 230.0
+    height_min: 1.05
+    height_target: 1.22
+    upright_min: 0.45
+    upright_target: 0.65
+  sustained_height:
+    weight: 180.0
+    height_min: 1.12
+    height_target: 1.20
+    upright_threshold: 0.65
+    reach_height: 1.20
+    fall_height: 1.00
+    fall_penalty: 160.0
   action_penalty:
-    weight: 2.0
+    weight: 3.0
 
 evaluation:
   eval_interval: 100000

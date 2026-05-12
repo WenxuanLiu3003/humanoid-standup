@@ -456,6 +456,62 @@ class TD3(Algorithm):
         )
         if self.stand_hold_upright_target <= self.stand_hold_upright_min:
             raise ValueError("TD3 stand_hold upright_target must exceed upright_min.")
+        full_extension_config = self.reward_shaping_config.get("full_extension", {})
+        self.full_extension_weight = float(full_extension_config.get("weight", 0.0))
+        self.full_extension_height_min = float(
+            full_extension_config.get("height_min", 1.05)
+        )
+        self.full_extension_height_target = float(
+            full_extension_config.get("height_target", 1.2)
+        )
+        if self.full_extension_height_target <= self.full_extension_height_min:
+            raise ValueError(
+                "TD3 full_extension height_target must exceed height_min."
+            )
+        self.full_extension_upright_min = float(
+            full_extension_config.get("upright_min", 0.45)
+        )
+        self.full_extension_upright_target = float(
+            full_extension_config.get("upright_target", 0.65)
+        )
+        if self.full_extension_upright_target <= self.full_extension_upright_min:
+            raise ValueError(
+                "TD3 full_extension upright_target must exceed upright_min."
+            )
+        sustained_height_config = self.reward_shaping_config.get(
+            "sustained_height",
+            {},
+        )
+        self.sustained_height_weight = float(
+            sustained_height_config.get("weight", 0.0)
+        )
+        self.sustained_height_min = float(
+            sustained_height_config.get("height_min", 1.12)
+        )
+        self.sustained_height_target = float(
+            sustained_height_config.get("height_target", 1.2)
+        )
+        if self.sustained_height_target <= self.sustained_height_min:
+            raise ValueError(
+                "TD3 sustained_height height_target must exceed height_min."
+            )
+        self.sustained_height_upright_threshold = float(
+            sustained_height_config.get("upright_threshold", 0.65)
+        )
+        self.sustained_height_reach_height = float(
+            sustained_height_config.get(
+                "reach_height",
+                self.sustained_height_target,
+            )
+        )
+        self.sustained_height_fall_height = float(
+            sustained_height_config.get("fall_height", 1.0)
+        )
+        self.sustained_height_fall_penalty = float(
+            sustained_height_config.get("fall_penalty", 0.0)
+        )
+        if self.sustained_height_fall_penalty < 0.0:
+            raise ValueError("TD3 sustained_height fall_penalty must be non-negative.")
         action_penalty_config = self.reward_shaping_config.get("action_penalty", {})
         self.action_penalty_weight = float(action_penalty_config.get("weight", 0.0))
         if self.action_penalty_weight < 0.0:
@@ -508,6 +564,7 @@ class TD3(Algorithm):
         self._last_observation: np.ndarray | None = None
         self._current_episode_return = np.zeros(self.num_envs, dtype=np.float64)
         self._current_episode_length = np.zeros(self.num_envs, dtype=np.int64)
+        self._sustained_height_reached = np.zeros(self.num_envs, dtype=np.bool_)
         self._episode_returns_since_log: list[float] = []
         self._episode_lengths_since_log: list[int] = []
         self._recent_episode_returns: deque[float] = deque(maxlen=100)
@@ -972,24 +1029,49 @@ class TD3(Algorithm):
             final_upright_mean = float(upright_array[-final_window:].mean())
             max_height = float(height_array.max())
 
-        success = (
-            final_height_mean >= self.height_threshold
-            and final_upright_mean >= self.upright_threshold
-            and max_height >= self.max_height_threshold
-            and (
-                self.return_threshold is None
-                or (float(np.mean(returns)) if returns else 0.0) >= self.return_threshold
-            )
+        return_mean = float(np.mean(returns)) if returns else 0.0
+        success_flags = self._evaluation_success_flags(
+            return_mean=return_mean,
+            final_height_mean=final_height_mean,
+            final_upright_mean=final_upright_mean,
+            max_height=max_height,
         )
         return {
-            "return_mean": float(np.mean(returns)) if returns else 0.0,
+            "return_mean": return_mean,
             "length_mean": float(np.mean(lengths)) if lengths else 0.0,
             "final_window_torso_height_mean": final_height_mean,
             "final_window_torso_upright_mean": final_upright_mean,
             "max_torso_height": max_height,
             "return_threshold": self.return_threshold,
-            "success": success,
+            **success_flags,
             "video_path": str(video_path) if render_video and video_path is not None else None,
+        }
+
+    def _evaluation_success_flags(
+        self,
+        *,
+        return_mean: float,
+        final_height_mean: float,
+        final_upright_mean: float,
+        max_height: float,
+    ) -> dict[str, bool]:
+        return_success = (
+            self.return_threshold is None or return_mean >= self.return_threshold
+        )
+        height_success = final_height_mean >= self.height_threshold
+        upright_success = final_upright_mean >= self.upright_threshold
+        max_height_success = max_height >= self.max_height_threshold
+        return {
+            "return_success": bool(return_success),
+            "height_success": bool(height_success),
+            "upright_success": bool(upright_success),
+            "max_height_success": bool(max_height_success),
+            "success": bool(
+                return_success
+                and height_success
+                and upright_success
+                and max_height_success
+            ),
         }
 
     def _predict_action(self, observations: np.ndarray) -> np.ndarray:
@@ -1147,6 +1229,18 @@ class TD3(Algorithm):
             stand_upright_score_array,
             stand_hold_reward_array,
         ) = self._stand_hold_reward_batch()
+        (
+            full_extension_height_score_array,
+            full_extension_upright_score_array,
+            full_extension_reward_array,
+        ) = self._full_extension_reward_batch()
+        (
+            sustained_height_score_array,
+            sustained_height_upright_gate_array,
+            sustained_height_reached_array,
+            sustained_height_fall_penalty_array,
+            sustained_height_reward_array,
+        ) = self._sustained_height_reward_batch()
         action_penalty_array, normalized_action_l2_array = (
             self._action_penalty_reward_batch(env_action)
         )
@@ -1162,6 +1256,8 @@ class TD3(Algorithm):
             + abdomen_force_reward_array
             + leg_angle_reward_array
             + stand_hold_reward_array
+            + full_extension_reward_array
+            + sustained_height_reward_array
             + action_penalty_array
         )
         self._extend_diagnostic("reward_environment", environment_reward_array)
@@ -1199,6 +1295,32 @@ class TD3(Algorithm):
             "stand_hold_scale",
             np.full(self.num_envs, self.stand_hold_scale, dtype=np.float32),
         )
+        self._extend_diagnostic(
+            "full_extension_height_score",
+            full_extension_height_score_array,
+        )
+        self._extend_diagnostic(
+            "full_extension_upright_score",
+            full_extension_upright_score_array,
+        )
+        self._extend_diagnostic("reward_full_extension", full_extension_reward_array)
+        self._extend_diagnostic(
+            "sustained_height_score",
+            sustained_height_score_array,
+        )
+        self._extend_diagnostic(
+            "sustained_height_upright_gate",
+            sustained_height_upright_gate_array,
+        )
+        self._extend_diagnostic(
+            "sustained_height_reached",
+            sustained_height_reached_array,
+        )
+        self._extend_diagnostic(
+            "sustained_height_fall_penalty",
+            sustained_height_fall_penalty_array,
+        )
+        self._extend_diagnostic("reward_sustained_height", sustained_height_reward_array)
         self._extend_diagnostic("reward_action_penalty", action_penalty_array)
         self._extend_diagnostic("normalized_action_l2", normalized_action_l2_array)
         return shaped_reward.astype(np.float32)
@@ -1498,6 +1620,85 @@ class TD3(Algorithm):
             stand_hold_reward.astype(np.float32, copy=False),
         )
 
+    def _full_extension_reward_batch(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        height_score = np.zeros(self.num_envs, dtype=np.float32)
+        upright_score = np.zeros(self.num_envs, dtype=np.float32)
+        if self.full_extension_weight == 0.0:
+            return height_score, upright_score, height_score.copy()
+
+        torso_height = np.zeros(self.num_envs, dtype=np.float32)
+        torso_upright = np.zeros(self.num_envs, dtype=np.float32)
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            torso_height[env_index], torso_upright[env_index] = self._torso_metrics(env)
+
+        height_score = np.clip(
+            (torso_height - self.full_extension_height_min)
+            / (self.full_extension_height_target - self.full_extension_height_min),
+            0.0,
+            1.0,
+        ).astype(np.float32, copy=False)
+        upright_score = np.clip(
+            (torso_upright - self.full_extension_upright_min)
+            / (self.full_extension_upright_target - self.full_extension_upright_min),
+            0.0,
+            1.0,
+        ).astype(np.float32, copy=False)
+        reward = self.full_extension_weight * height_score * upright_score
+        return (
+            height_score,
+            upright_score,
+            reward.astype(np.float32, copy=False),
+        )
+
+    def _sustained_height_reward_batch(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        height_score = np.zeros(self.num_envs, dtype=np.float32)
+        upright_gate = np.zeros(self.num_envs, dtype=np.float32)
+        reached = self._sustained_height_reached.astype(np.float32, copy=True)
+        fall_penalty = np.zeros(self.num_envs, dtype=np.float32)
+        if (
+            self.sustained_height_weight == 0.0
+            and self.sustained_height_fall_penalty == 0.0
+        ):
+            return height_score, upright_gate, reached, fall_penalty, height_score.copy()
+
+        torso_height = np.zeros(self.num_envs, dtype=np.float32)
+        torso_upright = np.zeros(self.num_envs, dtype=np.float32)
+        for env_index, env in enumerate(self._unwrapped_envs()):
+            torso_height[env_index], torso_upright[env_index] = self._torso_metrics(env)
+
+        upright_gate = (torso_upright >= self.sustained_height_upright_threshold).astype(
+            np.float32,
+        )
+        height_score = np.clip(
+            (torso_height - self.sustained_height_min)
+            / (self.sustained_height_target - self.sustained_height_min),
+            0.0,
+            1.0,
+        ).astype(np.float32, copy=False)
+        reached_now = (
+            (torso_height >= self.sustained_height_reach_height)
+            & (upright_gate > 0.0)
+        )
+        self._sustained_height_reached |= reached_now
+        fall_mask = self._sustained_height_reached & (
+            torso_height < self.sustained_height_fall_height
+        )
+        fall_penalty = (
+            -self.sustained_height_fall_penalty * fall_mask.astype(np.float32)
+        )
+        reward = self.sustained_height_weight * height_score * upright_gate + fall_penalty
+        return (
+            height_score,
+            upright_gate,
+            self._sustained_height_reached.astype(np.float32, copy=True),
+            fall_penalty.astype(np.float32, copy=False),
+            reward.astype(np.float32, copy=False),
+        )
+
     def _action_penalty_reward_batch(
         self,
         env_action: np.ndarray | None,
@@ -1544,6 +1745,7 @@ class TD3(Algorithm):
             next_observation, _ = self.env.reset()
         self._current_episode_return[done_array] = 0.0
         self._current_episode_length[done_array] = 0
+        self._sustained_height_reached[done_array] = False
         return self._as_observation_batch(next_observation)
 
     def _record_completed_episodes(self, done_array: np.ndarray) -> None:
@@ -1623,6 +1825,14 @@ class TD3(Algorithm):
             "stand_upright_score": [],
             "reward_stand_hold": [],
             "stand_hold_scale": [],
+            "full_extension_height_score": [],
+            "full_extension_upright_score": [],
+            "reward_full_extension": [],
+            "sustained_height_score": [],
+            "sustained_height_upright_gate": [],
+            "sustained_height_reached": [],
+            "sustained_height_fall_penalty": [],
+            "reward_sustained_height": [],
             "reward_action_penalty": [],
             "normalized_action_l2": [],
             "env_action_mean": [],
